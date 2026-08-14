@@ -25,7 +25,7 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Initialize Fresh Flutter Android Project
+      - name: Prepare Project and Inject Dependencies
         run: |
           mkdir -p temp_app
           cd temp_app
@@ -33,7 +33,7 @@ jobs:
           cp -r ../lib .
           flutter pub add flutter_bloc equatable geolocator telephony
           
-          # Force compileSdk 35 across all modules and align JVM targets to 11
+          # Patch SDK 35, namespace, and JVM 11 targets
           cat << 'EOF' >> android/build.gradle
 
           subprojects {
@@ -59,13 +59,14 @@ jobs:
           }
           EOF
 
-      - name: Build Release APK
+      - name: Build APK with Native Gradle
         run: |
-          cd temp_app
-          flutter build apk --release
+          cd temp_app/android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
 
       - name: Upload Finished APK
         uses: actions/upload-artifact@v4
         with:
           name: TrailSafe-Release-APK
-          path: temp_app/build/app/outputs/flutter-apk/app-release.apk
+          path: temp_app/build/app/outputs/apk/release/*.apk
