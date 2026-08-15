@@ -13,11 +13,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Java 21
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
-          java-version: '21'
+          java-version: '17'
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -31,7 +31,7 @@ jobs:
           cd temp_app
           flutter create --project-name=trailsafe --platforms=android .
           cp -r ../lib .
-          flutter pub add flutter_bloc equatable geolocator telephony sqflite path audioplayers shared_preferences
+          flutter pub add flutter_bloc equatable geolocator telephony shared_preferences
           
           # Patch AndroidManifest with SMS & Location Permissions
           cat << 'EOF' > android/app/src/main/AndroidManifest.xml
@@ -51,7 +51,6 @@ jobs:
                       android:name=".MainActivity"
                       android:exported="true"
                       android:launchMode="singleTop"
-                      android:taskAffinity=""
                       android:theme="@style/LaunchTheme"
                       android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
                       android:hardwareAccelerated="true"
@@ -81,7 +80,7 @@ jobs:
           </manifest>
           EOF
 
-          # Patch build.gradle for SDK 35 & Java 17 Compatibility
+          # Patch build.gradle for SDK 35 & JVM 11 target
           cat << 'EOF' >> android/build.gradle
 
           subprojects {
@@ -93,14 +92,14 @@ jobs:
                               namespace project.group
                           }
                           compileOptions {
-                              sourceCompatibility JavaVersion.VERSION_17
-                              targetCompatibility JavaVersion.VERSION_17
+                              sourceCompatibility JavaVersion.VERSION_11
+                              targetCompatibility JavaVersion.VERSION_11
                           }
                       }
                   }
                   tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
                       kotlinOptions {
-                          jvmTarget = "17"
+                          jvmTarget = "11"
                       }
                   }
               }
