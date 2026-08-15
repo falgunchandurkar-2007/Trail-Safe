@@ -1,30 +1,30 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:telephony/telephony.dart';
-import 'package:sqflite/sqflite.dart';
-import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 
 final Telephony telephony = Telephony.instance;
 
-// Top-level entry point for background SMS capture
+// Background SMS Receiver handler
 @pragma('vm:entry-point')
 void backgroundMessageHandler(SmsMessage message) async {
   final body = message.body ?? "";
   final sender = message.address ?? "Unknown";
   if (body.startsWith("[TS_MESH]")) {
-    final dbPath = await getDatabasesPath();
-    final db = await openDatabase(p.join(dbPath, 'trailsafe.db'), version: 1);
+    final prefs = await SharedPreferences.getInstance();
+    List<String> rawMsgs = prefs.getStringList('offline_messages') ?? [];
     final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
-    await db.insert('messages', {
+    rawMsgs.add(jsonEncode({
       'sender': sender,
       'text': cleanText,
-      'isMe': 0,
+      'isMe': false,
       'timestamp': DateTime.now().toIso8601String()
-    });
+    }));
+    await prefs.setStringList('offline_messages', rawMsgs);
   }
 }
 
@@ -52,44 +52,7 @@ class TrailSafeApp extends StatelessWidget {
   }
 }
 
-// ---------------- LOCAL DATABASE HELPER ----------------
-class LocalDatabase {
-  static Database? _db;
-
-  static Future<Database> get instance async {
-    if (_db != null) return _db!;
-    _db = await _initDB();
-    return _db!;
-  }
-
-  static Future<Database> _initDB() async {
-    final dbPath = await getDatabasesPath();
-    return await openDatabase(
-      p.join(dbPath, 'trailsafe.db'),
-      version: 1,
-      onCreate: (db, version) async {
-        await db.execute('''
-          CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender TEXT,
-            text TEXT,
-            isMe INTEGER,
-            timestamp TEXT
-          )
-        ''');
-        await db.execute('''
-          CREATE TABLE members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            phone TEXT
-          )
-        ''');
-      },
-    );
-  }
-}
-
-// ---------------- AUTH CHECK & LOGIN ----------------
+// ---------------- AUTH CHECK SCREEN ----------------
 class AuthCheckScreen extends StatefulWidget {
   const AuthCheckScreen({super.key});
   @override
@@ -100,15 +63,16 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
   @override
   void initState() {
     super.initState();
-    _checkLogin();
+    _checkStatus();
   }
 
-  void _checkLogin() async {
+  void _checkStatus() async {
     final prefs = await SharedPreferences.getInstance();
     final phone = prefs.getString('user_phone');
-    if (phone != null && mounted) {
+    if (!mounted) return;
+    if (phone != null && phone.isNotEmpty) {
       Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainNavigationScreen()));
-    } else if (mounted) {
+    } else {
       Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginOTPScreen()));
     }
   }
@@ -122,6 +86,7 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
   }
 }
 
+// ---------------- LOGIN WITH OTP SCREEN ----------------
 class LoginOTPScreen extends StatefulWidget {
   const LoginOTPScreen({super.key});
   @override
@@ -136,16 +101,17 @@ class _LoginOTPScreenState extends State<LoginOTPScreen> {
 
   void _sendOTP() async {
     if (_phoneCtrl.text.trim().length < 10) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Enter valid 10-digit number")));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Enter valid 10-digit phone number")));
       return;
     }
+    SystemSound.play(SystemSoundType.click);
+    HapticFeedback.mediumImpact();
     final otp = (1000 + Random().nextInt(9000)).toString();
     setState(() {
       generatedOTP = otp;
       isOtpSent = true;
     });
 
-    // Send Real SMS OTP to user's phone
     telephony.sendSms(
       to: _phoneCtrl.text.trim(),
       message: "[TrailSafe Security] Your authentication passcode is: $otp",
@@ -161,12 +127,15 @@ class _LoginOTPScreenState extends State<LoginOTPScreen> {
 
   void _verifyOTP() async {
     if (_otpCtrl.text.trim() == generatedOTP) {
+      SystemSound.play(SystemSoundType.click);
+      HapticFeedback.heavyImpact();
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('user_phone', _phoneCtrl.text.trim());
       if (mounted) {
         Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainNavigationScreen()));
       }
     } else {
+      HapticFeedback.vibrate();
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Invalid Passcode. Access Denied.")));
     }
   }
@@ -186,7 +155,7 @@ class _LoginOTPScreenState extends State<LoginOTPScreen> {
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
                     border: Border.all(color: const Color(0xFF00E676), width: 2),
-                    boxShadow: [BoxShadow(color: const Color(0xFF00E676).withOpacity(0.2), blurRadius: 20)],
+                    boxShadow: [BoxShadow(color: const Color(0xFF00E676).withOpacity(0.25), blurRadius: 20)],
                   ),
                   child: const Icon(Icons.shield_outlined, size: 54, color: Color(0xFF00E676)),
                 ),
@@ -272,7 +241,10 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       body: _screens[_currentIndex],
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _currentIndex,
-        onTap: (index) => setState(() => _currentIndex = index),
+        onTap: (index) {
+          SystemSound.play(SystemSoundType.click);
+          setState(() => _currentIndex = index);
+        },
         type: BottomNavigationBarType.fixed,
         backgroundColor: const Color(0xFF060E0A),
         selectedItemColor: const Color(0xFF00E676),
@@ -326,19 +298,24 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
         final sender = msg.address ?? "Unknown";
         if (body.startsWith("[TS_MESH]")) {
           final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
-          final db = await LocalDatabase.instance;
-          await db.insert('messages', {
+          final prefs = await SharedPreferences.getInstance();
+          List<String> rawMsgs = prefs.getStringList('offline_messages') ?? [];
+          rawMsgs.add(jsonEncode({
             'sender': sender,
             'text': cleanText,
-            'isMe': 0,
+            'isMe': false,
             'timestamp': DateTime.now().toIso8601String()
-          });
+          }));
+          await prefs.setStringList('offline_messages', rawMsgs);
+
+          SystemSound.play(SystemSoundType.alert);
           HapticFeedback.vibrate();
+
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
                 backgroundColor: const Color(0xFF132B1F),
-                content: Text("🚨 Incoming Mesh Signal from $sender: $cleanText", style: const TextStyle(color: Color(0xFF00E676))),
+                content: Text("🚨 Incoming Signal from $sender: $cleanText", style: const TextStyle(color: Color(0xFF00E676))),
               ),
             );
           }
@@ -364,47 +341,51 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
       });
     } catch (e) {
       setState(() {
-        _gpsText = "GPS Fixed via Satellites (Offline Fallback)";
+        _gpsText = "GPS Fixed via Satellites (Offline Mode)";
         _fetchingGps = false;
       });
     }
   }
 
   void _triggerEmergencySOS() async {
+    SystemSound.play(SystemSoundType.alert);
     HapticFeedback.heavyImpact();
-    final db = await LocalDatabase.instance;
-    final members = await db.query('members');
+
+    final prefs = await SharedPreferences.getInstance();
+    List<String> members = prefs.getStringList('mesh_members') ?? [];
 
     String coords = _currentPosition != null 
       ? "https://maps.google.com/?q=${_currentPosition!.latitude},${_currentPosition!.longitude}"
-      : "Lat/Lon Sat Locked";
+      : "Coordinates Locked via GPS";
 
     String payload = "[TS_MESH] 🚨 EMERGENCY ALERT: $_selectedEmergency! Location: $coords";
 
     if (members.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("No group members added. Add contacts in Group tab to dispatch SMS.")),
+        const SnackBar(content: Text("Add member numbers in Group tab to broadcast SMS alert.")),
       );
       return;
     }
 
     for (var m in members) {
-      final phone = m['phone'] as String;
-      telephony.sendSms(to: phone, message: payload);
+      final decoded = jsonDecode(m);
+      telephony.sendSms(to: decoded['phone'], message: payload);
     }
 
-    await db.insert('messages', {
+    List<String> rawMsgs = prefs.getStringList('offline_messages') ?? [];
+    rawMsgs.add(jsonEncode({
       'sender': 'ME (SOS)',
       'text': "🚨 EMERGENCY: $_selectedEmergency - $coords",
-      'isMe': 1,
+      'isMe': true,
       'timestamp': DateTime.now().toIso8601String()
-    });
+    }));
+    await prefs.setStringList('offline_messages', rawMsgs);
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: const Color(0xFFEF4444),
-          content: Text("⚡ SOS DISPATCHED TO ${members.length} MEMBERS OVER OFFLINE MESH", style: const TextStyle(fontWeight: FontWeight.bold)),
+          content: Text("⚡ SOS DISPATCHED TO ${members.length} MEMBERS OVER MESH", style: const TextStyle(fontWeight: FontWeight.bold)),
         ),
       );
     }
@@ -421,7 +402,7 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
             const Text("TrailSafe", style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: Colors.white)),
             const SizedBox(height: 14),
 
-            // GPS HUD Container
+            // GPS Telemetry HUD
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
               decoration: BoxDecoration(
@@ -437,7 +418,7 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text("GPS SATELLITE TELEMETRY", style: TextStyle(fontSize: 10, color: Color(0xFF4ADE80), letterSpacing: 1.2, fontWeight: FontWeight.bold)),
+                        const Text("GPS LOCATION", style: TextStyle(fontSize: 10, color: Color(0xFF4ADE80), letterSpacing: 1.2, fontWeight: FontWeight.bold)),
                         const SizedBox(height: 2),
                         Text(_gpsText, style: TextStyle(fontSize: 12, color: Colors.white.withOpacity(0.8))),
                       ],
@@ -455,7 +436,7 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
 
             const Spacer(),
 
-            // Red Concentric SOS Button
+            // Red SOS Button
             Center(
               child: GestureDetector(
                 onTap: _triggerEmergencySOS,
@@ -466,7 +447,7 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
                     shape: BoxShape.circle,
                     border: Border.all(color: const Color(0xFF7F1D1D), width: 3),
                     boxShadow: [
-                      BoxShadow(color: const Color(0xFFEF4444).withOpacity(0.3), blurRadius: 40, spreadRadius: 5),
+                      BoxShadow(color: const Color(0xFFEF4444).withOpacity(0.35), blurRadius: 40, spreadRadius: 5),
                     ],
                   ),
                   child: Center(
@@ -495,14 +476,17 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
             const Text("SELECT EMERGENCY TYPE", style: TextStyle(fontSize: 11, color: Color(0xFF4ADE80), letterSpacing: 1.5, fontWeight: FontWeight.bold)),
             const SizedBox(height: 12),
 
-            // Emergency Matrix Grid
+            // Emergency Chips Matrix
             Wrap(
               spacing: 8,
               runSpacing: 8,
               children: emergencies.map((item) {
                 final isSelected = _selectedEmergency == item['label'];
                 return GestureDetector(
-                  onTap: () => setState(() => _selectedEmergency = item['label']),
+                  onTap: () {
+                    SystemSound.play(SystemSoundType.click);
+                    setState(() => _selectedEmergency = item['label']);
+                  },
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                     decoration: BoxDecoration(
@@ -525,7 +509,6 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
 
             const SizedBox(height: 14),
 
-            // Group Members Status Bar
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
               decoration: BoxDecoration(
@@ -538,7 +521,7 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
                   Icon(Icons.group, color: Color(0xFF4ADE80), size: 20),
                   SizedBox(width: 10),
                   Expanded(
-                    child: Text("Active offline SMS mesh connected. Add contacts in Group tab.", style: TextStyle(fontSize: 11, color: Colors.white70)),
+                    child: Text("Offline SMS mesh active. Manage nodes in Group tab.", style: TextStyle(fontSize: 11, color: Colors.white70)),
                   )
                 ],
               ),
@@ -570,13 +553,14 @@ class _MeshGroupScreenState extends State<MeshGroupScreen> {
   }
 
   void _refreshData() async {
-    final db = await LocalDatabase.instance;
-    final msgs = await db.query('messages', orderBy: 'id ASC');
-    final mems = await db.query('members');
+    final prefs = await SharedPreferences.getInstance();
+    List<String> rawMsgs = prefs.getStringList('offline_messages') ?? [];
+    List<String> rawMems = prefs.getStringList('mesh_members') ?? [];
+
     if (mounted) {
       setState(() {
-        _messages = msgs;
-        _members = mems;
+        _messages = rawMsgs.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
+        _members = rawMems.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
       });
     }
   }
@@ -585,27 +569,30 @@ class _MeshGroupScreenState extends State<MeshGroupScreen> {
     final text = _msgCtrl.text.trim();
     if (text.isEmpty) return;
     _msgCtrl.clear();
+    SystemSound.play(SystemSoundType.click);
+    HapticFeedback.lightImpact();
 
-    final db = await LocalDatabase.instance;
-    final mems = await db.query('members');
+    final prefs = await SharedPreferences.getInstance();
+    List<String> rawMems = prefs.getStringList('mesh_members') ?? [];
 
-    if (mems.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Add group members using the (+) button first!")));
+    if (rawMems.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Add nodes using the (+) icon first!")));
       return;
     }
 
-    // Broadcast SMS with signature tag [TS_MESH]
-    for (var m in mems) {
-      telephony.sendSms(to: m['phone'] as String, message: "[TS_MESH] $text");
+    for (var m in rawMems) {
+      final decoded = jsonDecode(m);
+      telephony.sendSms(to: decoded['phone'], message: "[TS_MESH] $text");
     }
 
-    // Save to local database
-    await db.insert('messages', {
+    List<String> rawMsgs = prefs.getStringList('offline_messages') ?? [];
+    rawMsgs.add(jsonEncode({
       'sender': 'ME',
       'text': text,
-      'isMe': 1,
+      'isMe': true,
       'timestamp': DateTime.now().toIso8601String()
-    });
+    }));
+    await prefs.setStringList('offline_messages', rawMsgs);
 
     _refreshData();
   }
@@ -631,8 +618,10 @@ class _MeshGroupScreenState extends State<MeshGroupScreen> {
             style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00E676), foregroundColor: Colors.black),
             onPressed: () async {
               if (phoneCtrl.text.isNotEmpty) {
-                final db = await LocalDatabase.instance;
-                await db.insert('members', {'name': nameCtrl.text, 'phone': phoneCtrl.text.trim()});
+                final prefs = await SharedPreferences.getInstance();
+                List<String> mems = prefs.getStringList('mesh_members') ?? [];
+                mems.add(jsonEncode({'name': nameCtrl.text, 'phone': phoneCtrl.text.trim()}));
+                await prefs.setStringList('mesh_members', mems);
                 _refreshData();
                 Navigator.pop(context);
               }
@@ -672,7 +661,7 @@ class _MeshGroupScreenState extends State<MeshGroupScreen> {
               itemCount: _messages.length,
               itemBuilder: (_, i) {
                 final m = _messages[i];
-                final isMe = m['isMe'] == 1;
+                final isMe = m['isMe'] == true;
                 return Align(
                   alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
                   child: Container(
