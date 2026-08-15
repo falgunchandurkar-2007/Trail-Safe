@@ -13,11 +13,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Java
+      - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
-          java-version: '17'
+          java-version: '21'
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -81,7 +81,7 @@ jobs:
           </manifest>
           EOF
 
-          # Patch build.gradle for SDK 35 & JVM 11 target
+          # Patch build.gradle for SDK 35 & Java 17 Compatibility
           cat << 'EOF' >> android/build.gradle
 
           subprojects {
@@ -93,14 +93,14 @@ jobs:
                               namespace project.group
                           }
                           compileOptions {
-                              sourceCompatibility JavaVersion.VERSION_11
-                              targetCompatibility JavaVersion.VERSION_11
+                              sourceCompatibility JavaVersion.VERSION_17
+                              targetCompatibility JavaVersion.VERSION_17
                           }
                       }
                   }
                   tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
                       kotlinOptions {
-                          jvmTarget = "11"
+                          jvmTarget = "17"
                       }
                   }
               }
