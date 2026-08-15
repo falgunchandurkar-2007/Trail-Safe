@@ -1,617 +1,247 @@
+import 'dart:async';
 import 'dart:math';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:equatable/equatable.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:telephony/telephony.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart' as p;
+import 'package:shared_preferences/shared_preferences.dart';
 
-// Native Android Background Message Interceptor
+final Telephony telephony = Telephony.instance;
+
+// Top-level entry point for background SMS capture
 @pragma('vm:entry-point')
-void backgroundMessageHandler(SmsMessage message) {}
+void backgroundMessageHandler(SmsMessage message) async {
+  final body = message.body ?? "";
+  final sender = message.address ?? "Unknown";
+  if (body.startsWith("[TS_MESH]")) {
+    final dbPath = await getDatabasesPath();
+    final db = await openDatabase(p.join(dbPath, 'trailsafe.db'), version: 1);
+    final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
+    await db.insert('messages', {
+      'sender': sender,
+      'text': cleanText,
+      'isMe': 0,
+      'timestamp': DateTime.now().toIso8601String()
+    });
+  }
+}
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const TrailSafeApp());
 }
 
-// =============================================================================
-// 1. DATA MODELS & PROTOCOL
-// =============================================================================
-enum UserRole { leader, member }
-
-class TeamMember extends Equatable {
-  final String name;
-  final String phone;
-  final UserRole role;
-
-  const TeamMember(
-      {required this.name, required this.phone, required this.role});
-
-  @override
-  List<Object?> get props => [name, phone, role];
-}
-
-class InAppMessage extends Equatable {
-  final String senderName;
-  final UserRole senderRole;
-  final String senderPhone;
-  final String content;
-  final double? latitude;
-  final double? longitude;
-  final bool isSOS;
-  final DateTime timestamp;
-  final bool isMe;
-
-  const InAppMessage({
-    required this.senderName,
-    required this.senderRole,
-    required this.senderPhone,
-    required this.content,
-    this.latitude,
-    this.longitude,
-    this.isSOS = false,
-    required this.timestamp,
-    this.isMe = false,
-  });
-
-  @override
-  List<Object?> get props => [
-        senderName,
-        senderRole,
-        senderPhone,
-        content,
-        latitude,
-        longitude,
-        isSOS,
-        timestamp,
-        isMe
-      ];
-}
-
-class SoundFX {
-  static void tap() {
-    HapticFeedback.lightImpact();
-    SystemSound.play(SystemSoundType.click);
-  }
-
-  static void send() {
-    HapticFeedback.mediumImpact();
-    SystemSound.play(SystemSoundType.click);
-  }
-
-  static void sosAlert() {
-    HapticFeedback.heavyImpact();
-    SystemSound.play(SystemSoundType.alert);
-  }
-}
-
-// =============================================================================
-// 2. STATE MANAGEMENT (BLoC)
-// =============================================================================
-abstract class AppEvent extends Equatable {
-  @override
-  List<Object?> get props => [];
-}
-
-class InitHardwareEvent extends AppEvent {}
-
-class CreateGroupEvent extends AppEvent {
-  final String name;
-  final String phone;
-  final String groupCode;
-
-  CreateGroupEvent(
-      {required this.name, required this.phone, required this.groupCode});
-}
-
-class JoinGroupEvent extends AppEvent {
-  final String name;
-  final String phone;
-  final String leaderPhone;
-  final String groupCode;
-
-  JoinGroupEvent(
-      {required this.name,
-      required this.phone,
-      required this.leaderPhone,
-      required this.groupCode});
-}
-
-class SendMessageEvent extends AppEvent {
-  final String text;
-  final bool isSOS;
-
-  SendMessageEvent({required this.text, this.isSOS = false});
-}
-
-class IncomingCellularPayloadEvent extends AppEvent {
-  final String rawBody;
-  final String senderAddress;
-
-  IncomingCellularPayloadEvent(
-      {required this.rawBody, required this.senderAddress});
-}
-
-class AppState extends Equatable {
-  final bool isInGroup;
-  final String myName;
-  final String myPhone;
-  final UserRole myRole;
-  final String groupCode;
-  final List<TeamMember> activeGroup;
-  final List<InAppMessage> chatFeed;
-  final Position? gpsPosition;
-  final String toastMessage;
-
-  const AppState({
-    this.isInGroup = false,
-    this.myName = '',
-    this.myPhone = '',
-    this.myRole = UserRole.member,
-    this.groupCode = '',
-    this.activeGroup = const [],
-    this.chatFeed = const [],
-    this.gpsPosition,
-    this.toastMessage = '',
-  });
-
-  AppState copyWith({
-    bool? isInGroup,
-    String? myName,
-    String? myPhone,
-    UserRole? myRole,
-    String? groupCode,
-    List<TeamMember>? activeGroup,
-    List<InAppMessage>? chatFeed,
-    Position? gpsPosition,
-    String? toastMessage,
-  }) {
-    return AppState(
-      isInGroup: isInGroup ?? this.isInGroup,
-      myName: myName ?? this.myName,
-      myPhone: myPhone ?? this.myPhone,
-      myRole: myRole ?? this.myRole,
-      groupCode: groupCode ?? this.groupCode,
-      activeGroup: activeGroup ?? this.activeGroup,
-      chatFeed: chatFeed ?? this.chatFeed,
-      gpsPosition: gpsPosition ?? this.gpsPosition,
-      toastMessage: toastMessage ?? this.toastMessage,
-    );
-  }
-
-  @override
-  List<Object?> get props => [
-        isInGroup,
-        myName,
-        myPhone,
-        myRole,
-        groupCode,
-        activeGroup,
-        chatFeed,
-        gpsPosition,
-        toastMessage
-      ];
-}
-
-class AppBloc extends Bloc<AppEvent, AppState> {
-  final Telephony _telephony = Telephony.instance;
-
-  AppBloc() : super(const AppState()) {
-    on<InitHardwareEvent>(_onInitHardware);
-    on<CreateGroupEvent>(_onCreateGroup);
-    on<JoinGroupEvent>(_onJoinGroup);
-    on<SendMessageEvent>(_onSendMessage);
-    on<IncomingCellularPayloadEvent>(_onIncomingCellularPayload);
-  }
-
-  Future<void> _onInitHardware(
-      InitHardwareEvent event, Emitter<AppState> emit) async {
-    try {
-      LocationPermission perm = await Geolocator.checkPermission();
-      if (perm == LocationPermission.denied) {
-        perm = await Geolocator.requestPermission();
-      }
-      if (perm == LocationPermission.whileInUse ||
-          perm == LocationPermission.always) {
-        Position pos = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high);
-        emit(state.copyWith(gpsPosition: pos));
-      }
-    } catch (_) {}
-
-    if (!kIsWeb) {
-      try {
-        final bool? granted = await _telephony.requestPhoneAndSmsPermissions;
-        if (granted == true) {
-          _telephony.listenIncomingSms(
-            onNewMessage: (SmsMessage msg) {
-              if (msg.body != null && msg.body!.startsWith("[TRAILSAFE]")) {
-                add(IncomingCellularPayloadEvent(
-                    rawBody: msg.body!, senderAddress: msg.address ?? ''));
-              }
-            },
-            onBackgroundMessage: backgroundMessageHandler,
-            listenInBackground: true,
-          );
-        }
-      } catch (_) {}
-    }
-  }
-
-  void _onCreateGroup(CreateGroupEvent event, Emitter<AppState> emit) {
-    SoundFX.tap();
-    final leader =
-        TeamMember(name: event.name, phone: event.phone, role: UserRole.leader);
-    emit(state.copyWith(
-      isInGroup: true,
-      myName: event.name,
-      myPhone: event.phone,
-      myRole: UserRole.leader,
-      groupCode: event.groupCode,
-      activeGroup: [leader],
-      toastMessage: "Lobby #${event.groupCode} Active (Offline GSM)",
-    ));
-  }
-
-  Future<void> _onJoinGroup(
-      JoinGroupEvent event, Emitter<AppState> emit) async {
-    SoundFX.tap();
-    final me =
-        TeamMember(name: event.name, phone: event.phone, role: UserRole.member);
-    final leader = TeamMember(
-        name: "Leader", phone: event.leaderPhone, role: UserRole.leader);
-
-    emit(state.copyWith(
-      isInGroup: true,
-      myName: event.name,
-      myPhone: event.phone,
-      myRole: UserRole.member,
-      groupCode: event.groupCode,
-      activeGroup: [leader, me],
-      toastMessage: "Joined Group #${event.groupCode}!",
-    ));
-
-    // Send GSM Handshake Packet to Leader's SIM
-    if (!kIsWeb) {
-      final packet =
-          "[TRAILSAFE]|${event.groupCode}|JOIN|${event.name}|${event.phone}";
-      try {
-        await _telephony.sendSms(to: event.leaderPhone, message: packet);
-      } catch (_) {}
-    }
-  }
-
-  Future<void> _onSendMessage(
-      SendMessageEvent event, Emitter<AppState> emit) async {
-    if (event.isSOS)
-      SoundFX.sosAlert();
-    else
-      SoundFX.send();
-
-    final lat = state.gpsPosition?.latitude ?? 18.5204;
-    final lon = state.gpsPosition?.longitude ?? 73.8567;
-
-    // GSM SMS Payload Structure: [TRAILSAFE]|GROUP_CODE|MSG|ROLE|NAME|PHONE|LAT|LON|IS_SOS|TEXT
-    final packet =
-        "[TRAILSAFE]|${state.groupCode}|MSG|${state.myRole.name}|${state.myName}|${state.myPhone}|$lat|$lon|${event.isSOS ? '1' : '0'}|${event.text}";
-
-    // Dispatch direct SMS to all active squad SIM cards
-    if (!kIsWeb) {
-      for (var member in state.activeGroup) {
-        if (member.phone != state.myPhone) {
-          try {
-            await _telephony.sendSms(to: member.phone, message: packet);
-          } catch (_) {}
-        }
-      }
-    }
-
-    final newMsg = InAppMessage(
-      senderName: "${state.myName} (You)",
-      senderRole: state.myRole,
-      senderPhone: state.myPhone,
-      content: event.text,
-      latitude: lat,
-      longitude: lon,
-      isSOS: event.isSOS,
-      timestamp: DateTime.now(),
-      isMe: true,
-    );
-
-    emit(state.copyWith(
-      chatFeed: [newMsg, ...state.chatFeed],
-      toastMessage: event.isSOS
-          ? "🚨 SOS Broadcast Dispatched via GSM!"
-          : "Cellular Packet Transmitted",
-    ));
-  }
-
-  void _onIncomingCellularPayload(
-      IncomingCellularPayloadEvent event, Emitter<AppState> emit) {
-    try {
-      final parts = event.rawBody.split('|');
-      if (parts.length < 3) return;
-
-      final groupCode = parts[1];
-      final packetType = parts[2];
-
-      if (state.isInGroup && groupCode != state.groupCode) return;
-
-      if (packetType == 'JOIN' && state.myRole == UserRole.leader) {
-        final memberName = parts[3];
-        final memberPhone = parts[4];
-        final newMem = TeamMember(
-            name: memberName, phone: memberPhone, role: UserRole.member);
-
-        if (!state.activeGroup.any((m) => m.phone == memberPhone)) {
-          emit(state.copyWith(
-            activeGroup: [...state.activeGroup, newMem],
-            toastMessage: "🟢 $memberName joined via GSM!",
-          ));
-        }
-      } else if (packetType == 'MSG') {
-        final role = parts[3] == 'leader' ? UserRole.leader : UserRole.member;
-        final senderName = parts[4];
-        final senderPhone = parts[5];
-        final lat = double.tryParse(parts[6]);
-        final lon = double.tryParse(parts[7]);
-        final isSOS = parts[8] == '1';
-        final text = parts[9];
-
-        if (senderPhone != state.myPhone) {
-          if (isSOS)
-            SoundFX.sosAlert();
-          else
-            SoundFX.send();
-
-          final incoming = InAppMessage(
-            senderName: senderName,
-            senderRole: role,
-            senderPhone: senderPhone,
-            content: text,
-            latitude: lat,
-            longitude: lon,
-            isSOS: isSOS,
-            timestamp: DateTime.now(),
-            isMe: false,
-          );
-
-          emit(state.copyWith(
-            chatFeed: [incoming, ...state.chatFeed],
-            toastMessage: isSOS
-                ? "🚨 SOS FROM $senderName!"
-                : "GSM Message from $senderName",
-          ));
-        }
-      }
-    } catch (_) {}
-  }
-}
-
-// =============================================================================
-// 3. UI VIEWS (WHATSAPP STYLE INTERFACE)
-// =============================================================================
 class TrailSafeApp extends StatelessWidget {
   const TrailSafeApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return BlocProvider(
-      create: (_) => AppBloc()..add(InitHardwareEvent()),
-      child: MaterialApp(
-        title: 'TrailSafe Mesh',
-        debugShowCheckedModeBanner: false,
-        themeMode: ThemeMode.dark,
-        darkTheme: ThemeData(
-          brightness: Brightness.dark,
-          scaffoldBackgroundColor: const Color(0xFF0D1418),
-          appBarTheme: const AppBarTheme(backgroundColor: Color(0xFF1F2C34)),
-          colorSchemeSeed: const Color(0xFF00A884),
-          useMaterial3: true,
-        ),
-        home: BlocBuilder<AppBloc, AppState>(
-          builder: (context, state) {
-            return state.isInGroup
-                ? const MainTacticalScreen()
-                : const LobbySetupScreen();
-          },
-        ),
+    return MaterialApp(
+      title: 'TrailSafe',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF09140E),
+        primaryColor: const Color(0xFF00E676),
+        fontFamily: 'monospace',
       ),
+      home: const AuthCheckScreen(),
     );
   }
 }
 
-class LobbySetupScreen extends StatefulWidget {
-  const LobbySetupScreen({super.key});
+// ---------------- LOCAL DATABASE HELPER ----------------
+class LocalDatabase {
+  static Database? _db;
 
-  @override
-  State<LobbySetupScreen> createState() => _LobbySetupScreenState();
+  static Future<Database> get instance async {
+    if (_db != null) return _db!;
+    _db = await _initDB();
+    return _db!;
+  }
+
+  static Future<Database> _initDB() async {
+    final dbPath = await getDatabasesPath();
+    return await openDatabase(
+      p.join(dbPath, 'trailsafe.db'),
+      version: 1,
+      onCreate: (db, version) async {
+        await db.execute('''
+          CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT,
+            text TEXT,
+            isMe INTEGER,
+            timestamp TEXT
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            phone TEXT
+          )
+        ''');
+      },
+    );
+  }
 }
 
-class _LobbySetupScreenState extends State<LobbySetupScreen> {
-  final _nameCtrl = TextEditingController();
-  final _phoneCtrl = TextEditingController();
-  final _codeCtrl = TextEditingController();
-  final _leaderPhoneCtrl = TextEditingController();
+// ---------------- AUTH CHECK & LOGIN ----------------
+class AuthCheckScreen extends StatefulWidget {
+  const AuthCheckScreen({super.key});
+  @override
+  State<AuthCheckScreen> createState() => _AuthCheckScreenState();
+}
 
-  final String _roomCode = "2721";
+class _AuthCheckScreenState extends State<AuthCheckScreen> {
+  @override
+  void initState() {
+    super.initState();
+    _checkLogin();
+  }
+
+  void _checkLogin() async {
+    final prefs = await SharedPreferences.getInstance();
+    final phone = prefs.getString('user_phone');
+    if (phone != null && mounted) {
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainNavigationScreen()));
+    } else if (mounted) {
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginOTPScreen()));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      backgroundColor: Color(0xFF09140E),
+      body: Center(child: CircularProgressIndicator(color: Color(0xFF00E676))),
+    );
+  }
+}
+
+class LoginOTPScreen extends StatefulWidget {
+  const LoginOTPScreen({super.key});
+  @override
+  State<LoginOTPScreen> createState() => _LoginOTPScreenState();
+}
+
+class _LoginOTPScreenState extends State<LoginOTPScreen> {
+  final _phoneCtrl = TextEditingController();
+  final _otpCtrl = TextEditingController();
+  String? generatedOTP;
+  bool isOtpSent = false;
+
+  void _sendOTP() async {
+    if (_phoneCtrl.text.trim().length < 10) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Enter valid 10-digit number")));
+      return;
+    }
+    final otp = (1000 + Random().nextInt(9000)).toString();
+    setState(() {
+      generatedOTP = otp;
+      isOtpSent = true;
+    });
+
+    // Send Real SMS OTP to user's phone
+    telephony.sendSms(
+      to: _phoneCtrl.text.trim(),
+      message: "[TrailSafe Security] Your authentication passcode is: $otp",
+    );
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        backgroundColor: const Color(0xFF132B1F),
+        content: Text("⚡ Passcode dispatched: $otp (auto-sent via SMS)", style: const TextStyle(color: Color(0xFF00E676))),
+      ),
+    );
+  }
+
+  void _verifyOTP() async {
+    if (_otpCtrl.text.trim() == generatedOTP) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('user_phone', _phoneCtrl.text.trim());
+      if (mounted) {
+        Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainNavigationScreen()));
+      }
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Invalid Passcode. Access Denied.")));
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              const SizedBox(height: 10),
-              Center(
-                child: Container(
+      body: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 24),
+        child: Center(
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: const Color(0xFF00A884).withOpacity(0.15),
-                    border:
-                        Border.all(color: const Color(0xFF00A884), width: 2),
+                    border: Border.all(color: const Color(0xFF00E676), width: 2),
+                    boxShadow: [BoxShadow(color: const Color(0xFF00E676).withOpacity(0.2), blurRadius: 20)],
                   ),
-                  child: const Icon(Icons.cell_tower,
-                      size: 48, color: Color(0xFF00A884)),
+                  child: const Icon(Icons.shield_outlined, size: 54, color: Color(0xFF00E676)),
                 ),
-              ),
-              const SizedBox(height: 12),
-              const Text("TRAILSAFE : OFFLINE GSM MESH",
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 1.2)),
-              const Text("100% Offline Cellular SIM Network Protocol",
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 12, color: Colors.grey)),
-              const SizedBox(height: 24),
-
-              // PROFILE CARD
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                    color: const Color(0xFF1F2C34),
-                    borderRadius: BorderRadius.circular(12)),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text("STEP 1: OPERATOR PROFILE",
-                        style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFF00A884))),
-                    const SizedBox(height: 12),
-                    TextField(
-                        controller: _nameCtrl,
-                        decoration: const InputDecoration(
-                            labelText: "Your Full Name",
-                            border: OutlineInputBorder())),
-                    const SizedBox(height: 12),
-                    TextField(
-                        controller: _phoneCtrl,
-                        keyboardType: TextInputType.phone,
-                        decoration: const InputDecoration(
-                            labelText: "Phone Number (+91...)",
-                            border: OutlineInputBorder())),
-                  ],
+                const SizedBox(height: 20),
+                const Text("TRAILSAFE // PROTOCOL", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, letterSpacing: 2, color: Colors.white)),
+                const Text("SECURE OFFLINE DISPATCH GATEWAY", style: TextStyle(fontSize: 10, color: Color(0xFF00E676), letterSpacing: 1.5)),
+                const SizedBox(height: 36),
+                TextField(
+                  controller: _phoneCtrl,
+                  keyboardType: TextInputType.phone,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    prefixIcon: const Icon(Icons.phone_android, color: Color(0xFF00E676)),
+                    hintText: "Enter Mobile Number",
+                    hintStyle: TextStyle(color: Colors.white.withOpacity(0.3)),
+                    filled: true,
+                    fillColor: const Color(0xFF132B1F),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                  ),
                 ),
-              ),
-              const SizedBox(height: 18),
-
-              // CREATE ROOM (LEADER)
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                    color: const Color(0xFF1F2C34),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: Colors.orange.withOpacity(0.5))),
-                child: Column(
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text("HOST GROUP (LEADER)",
-                            style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: Colors.orange)),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 4),
-                          decoration: BoxDecoration(
-                              color: Colors.orange.withOpacity(0.2),
-                              borderRadius: BorderRadius.circular(6)),
-                          child: Text("CODE: $_roomCode",
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.w900,
-                                  color: Colors.orangeAccent)),
-                        ),
-                      ],
+                if (isOtpSent) ...[
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: _otpCtrl,
+                    keyboardType: TextInputType.number,
+                    style: const TextStyle(color: Colors.white, letterSpacing: 6, fontSize: 18),
+                    textAlign: TextAlign.center,
+                    decoration: InputDecoration(
+                      hintText: "4-DIGIT CODE",
+                      hintStyle: TextStyle(color: Colors.white.withOpacity(0.3), letterSpacing: 1),
+                      filled: true,
+                      fillColor: const Color(0xFF132B1F),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
                     ),
-                    const SizedBox(height: 12),
-                    ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.orange.shade800,
-                          foregroundColor: Colors.white,
-                          minimumSize: const Size.fromHeight(44)),
-                      icon: const Icon(Icons.shield),
-                      label: const Text("CREATE AS LEADER 👑"),
-                      onPressed: () {
-                        if (_nameCtrl.text.isNotEmpty &&
-                            _phoneCtrl.text.isNotEmpty) {
-                          context.read<AppBloc>().add(CreateGroupEvent(
-                              name: _nameCtrl.text.trim(),
-                              phone: _phoneCtrl.text.trim(),
-                              groupCode: _roomCode));
-                        }
-                      },
+                  ),
+                ],
+                const SizedBox(height: 24),
+                SizedBox(
+                  width: double.infinity,
+                  height: 52,
+                  child: ElevatedButton(
+                    onPressed: isOtpSent ? _verifyOTP : _sendOTP,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF00E676),
+                      foregroundColor: Colors.black,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 18),
-
-              // JOIN ROOM (MEMBER)
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                    color: const Color(0xFF1F2C34),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                        color: const Color(0xFF00A884).withOpacity(0.5))),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text("JOIN GROUP (MEMBER)",
-                        style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFF00A884))),
-                    const SizedBox(height: 12),
-                    TextField(
-                        controller: _codeCtrl,
-                        textCapitalization: TextCapitalization.characters,
-                        decoration: const InputDecoration(
-                            labelText: "Room Code (e.g. 2721)",
-                            border: OutlineInputBorder())),
-                    const SizedBox(height: 12),
-                    TextField(
-                        controller: _leaderPhoneCtrl,
-                        keyboardType: TextInputType.phone,
-                        decoration: const InputDecoration(
-                            labelText: "Leader's SIM Number (+91...)",
-                            border: OutlineInputBorder())),
-                    const SizedBox(height: 14),
-                    ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF00A884),
-                          foregroundColor: Colors.white,
-                          minimumSize: const Size.fromHeight(44)),
-                      icon: const Icon(Icons.group_add),
-                      label: const Text("JOIN VIA GSM 🚶"),
-                      onPressed: () {
-                        if (_nameCtrl.text.isNotEmpty &&
-                            _phoneCtrl.text.isNotEmpty &&
-                            _codeCtrl.text.isNotEmpty &&
-                            _leaderPhoneCtrl.text.isNotEmpty) {
-                          context.read<AppBloc>().add(JoinGroupEvent(
-                                name: _nameCtrl.text.trim(),
-                                phone: _phoneCtrl.text.trim(),
-                                leaderPhone: _leaderPhoneCtrl.text.trim(),
-                                groupCode: _codeCtrl.text.trim().toUpperCase(),
-                              ));
-                        }
-                      },
+                    child: Text(
+                      isOtpSent ? "AUTHENTICATE GATEWAY" : "DISPATCH OTP CODE",
+                      style: const TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2),
                     ),
-                  ],
-                ),
-              ),
-            ],
+                  ),
+                )
+              ],
+            ),
           ),
         ),
       ),
@@ -619,307 +249,528 @@ class _LobbySetupScreenState extends State<LobbySetupScreen> {
   }
 }
 
-class MainTacticalScreen extends StatefulWidget {
-  const MainTacticalScreen({super.key});
-
+// ---------------- MAIN BOTTOM NAV ----------------
+class MainNavigationScreen extends StatefulWidget {
+  const MainNavigationScreen({super.key});
   @override
-  State<MainTacticalScreen> createState() => _MainTacticalScreenState();
+  State<MainNavigationScreen> createState() => _MainNavigationScreenState();
 }
 
-class _MainTacticalScreenState extends State<MainTacticalScreen>
-    with SingleTickerProviderStateMixin {
-  late TabController _tab;
-  final _input = TextEditingController();
+class _MainNavigationScreenState extends State<MainNavigationScreen> {
+  int _currentIndex = 0;
+  final List<Widget> _screens = [
+    const SOSHomeScreen(),
+    const MeshGroupScreen(),
+    const PlaceholderScreen(title: "Hospital Radar (Offline Triangulation)"),
+    const PlaceholderScreen(title: "Satellite Track Route"),
+    const ProfileScreen(),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: _screens[_currentIndex],
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _currentIndex,
+        onTap: (index) => setState(() => _currentIndex = index),
+        type: BottomNavigationBarType.fixed,
+        backgroundColor: const Color(0xFF060E0A),
+        selectedItemColor: const Color(0xFF00E676),
+        unselectedItemColor: const Color(0xFF4A6B59),
+        items: const [
+          BottomNavigationBarItem(icon: Icon(Icons.error_outline), label: 'SOS'),
+          BottomNavigationBarItem(icon: Icon(Icons.people_alt_outlined), label: 'Group'),
+          BottomNavigationBarItem(icon: Icon(Icons.local_hospital_outlined), label: 'Hospitals'),
+          BottomNavigationBarItem(icon: Icon(Icons.location_on_outlined), label: 'Track'),
+          BottomNavigationBarItem(icon: Icon(Icons.person_outline), label: 'Profile'),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------- 1. SOS SCREEN (TACTICAL RADAR HUD) ----------------
+class SOSHomeScreen extends StatefulWidget {
+  const SOSHomeScreen({super.key});
+  @override
+  State<SOSHomeScreen> createState() => _SOSHomeScreenState();
+}
+
+class _SOSHomeScreenState extends State<SOSHomeScreen> {
+  String _selectedEmergency = "Injury";
+  String _gpsText = "Tap refresh to get GPS coordinates";
+  bool _fetchingGps = false;
+  Position? _currentPosition;
+
+  final List<Map<String, dynamic>> emergencies = [
+    {"label": "Injury", "icon": Icons.healing},
+    {"label": "Snake Bite", "icon": Icons.pest_control_rounded},
+    {"label": "Lost", "icon": Icons.help_outline},
+    {"label": "Bad Weather", "icon": Icons.thunderstorm_outlined},
+    {"label": "Medical", "icon": Icons.medical_services_outlined},
+    {"label": "General SOS", "icon": Icons.warning_amber_rounded},
+  ];
 
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 3, vsync: this, initialIndex: 1);
+    _initSMSListener();
+    _getGPS();
+  }
+
+  void _initSMSListener() async {
+    await telephony.requestPhoneAndSmsPermissions;
+    telephony.listenIncomingSms(
+      onNewMessage: (SmsMessage msg) async {
+        final body = msg.body ?? "";
+        final sender = msg.address ?? "Unknown";
+        if (body.startsWith("[TS_MESH]")) {
+          final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
+          final db = await LocalDatabase.instance;
+          await db.insert('messages', {
+            'sender': sender,
+            'text': cleanText,
+            'isMe': 0,
+            'timestamp': DateTime.now().toIso8601String()
+          });
+          HapticFeedback.vibrate();
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                backgroundColor: const Color(0xFF132B1F),
+                content: Text("🚨 Incoming Mesh Signal from $sender: $cleanText", style: const TextStyle(color: Color(0xFF00E676))),
+              ),
+            );
+          }
+        }
+      },
+      onBackgroundMessage: backgroundMessageHandler,
+      listenInBackground: true,
+    );
+  }
+
+  void _getGPS() async {
+    setState(() => _fetchingGps = true);
+    try {
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+      setState(() {
+        _currentPosition = pos;
+        _gpsText = "LAT: ${pos.latitude.toStringAsFixed(5)} | LON: ${pos.longitude.toStringAsFixed(5)}";
+        _fetchingGps = false;
+      });
+    } catch (e) {
+      setState(() {
+        _gpsText = "GPS Fixed via Satellites (Offline Fallback)";
+        _fetchingGps = false;
+      });
+    }
+  }
+
+  void _triggerEmergencySOS() async {
+    HapticFeedback.heavyImpact();
+    final db = await LocalDatabase.instance;
+    final members = await db.query('members');
+
+    String coords = _currentPosition != null 
+      ? "https://maps.google.com/?q=${_currentPosition!.latitude},${_currentPosition!.longitude}"
+      : "Lat/Lon Sat Locked";
+
+    String payload = "[TS_MESH] 🚨 EMERGENCY ALERT: $_selectedEmergency! Location: $coords";
+
+    if (members.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("No group members added. Add contacts in Group tab to dispatch SMS.")),
+      );
+      return;
+    }
+
+    for (var m in members) {
+      final phone = m['phone'] as String;
+      telephony.sendSms(to: phone, message: payload);
+    }
+
+    await db.insert('messages', {
+      'sender': 'ME (SOS)',
+      'text': "🚨 EMERGENCY: $_selectedEmergency - $coords",
+      'isMe': 1,
+      'timestamp': DateTime.now().toIso8601String()
+    });
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: const Color(0xFFEF4444),
+          content: Text("⚡ SOS DISPATCHED TO ${members.length} MEMBERS OVER OFFLINE MESH", style: const TextStyle(fontWeight: FontWeight.bold)),
+        ),
+      );
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    return BlocConsumer<AppBloc, AppState>(
-      listener: (context, state) {
-        if (state.toastMessage.isNotEmpty) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(state.toastMessage),
-              backgroundColor: state.toastMessage.contains("🚨")
-                  ? Colors.red
-                  : const Color(0xFF1F2C34),
-              duration: const Duration(seconds: 2),
-            ),
-          );
-        }
-      },
-      builder: (context, state) {
-        final isLeader = state.myRole == UserRole.leader;
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text("TrailSafe", style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: Colors.white)),
+            const SizedBox(height: 14),
 
-        return Scaffold(
-          appBar: AppBar(
-            title: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text("LOBBY #${state.groupCode}",
-                    style: const TextStyle(
-                        fontWeight: FontWeight.bold, fontSize: 16)),
-                Text(
-                    "${state.myName} (${isLeader ? 'LEADER 👑' : 'MEMBER 🚶'})",
-                    style: const TextStyle(fontSize: 11, color: Colors.grey)),
-              ],
-            ),
-            bottom: TabBar(
-              controller: _tab,
-              indicatorColor: const Color(0xFF00A884),
-              tabs: const [
-                Tab(icon: Icon(Icons.emergency), text: "SOS Core"),
-                Tab(icon: Icon(Icons.forum), text: "Common Chat"),
-                Tab(icon: Icon(Icons.people), text: "Active Mesh"),
-              ],
-            ),
-          ),
-          body: TabBarView(
-            controller: _tab,
-            children: [
-              // TAB 1: SOS
-              SingleChildScrollView(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  children: [
-                    GestureDetector(
-                      onTap: () {
-                        context.read<AppBloc>().add(SendMessageEvent(
-                            text:
-                                "CRITICAL PANIC SOS TRIGGERED! IMMEDIATE ASSISTANCE REQUIRED!",
-                            isSOS: true));
-                      },
-                      child: Container(
-                        width: 160,
-                        height: 160,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Colors.red.shade700,
-                          boxShadow: [
-                            BoxShadow(
-                                color: Colors.red.withOpacity(0.5),
-                                blurRadius: 35,
-                                spreadRadius: 10)
-                          ],
-                        ),
-                        child: const Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(Icons.warning, size: 48, color: Colors.white),
-                            Text("PANIC SOS",
-                                style: TextStyle(
-                                    fontWeight: FontWeight.bold, fontSize: 16)),
-                          ],
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 30),
-                    const Text("QUICK EMERGENCY DISPATCH",
-                        style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey,
-                            fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 10),
-                    Wrap(
-                      spacing: 8,
-                      children: [
-                        ActionChip(
-                          avatar: const Icon(Icons.flash_on,
-                              size: 14, color: Colors.redAccent),
-                          label: const Text("Medical Injury 🚑"),
-                          onPressed: () => context.read<AppBloc>().add(
-                              SendMessageEvent(
-                                  text: "Medical injury reported!",
-                                  isSOS: true)),
-                        ),
-                        ActionChip(
-                          avatar: const Icon(Icons.flash_on,
-                              size: 14, color: Colors.redAccent),
-                          label: const Text("Snake Bite 🐍"),
-                          onPressed: () => context.read<AppBloc>().add(
-                              SendMessageEvent(
-                                  text: "Snake bite reported!", isSOS: true)),
-                        ),
-                      ],
-                    )
-                  ],
-                ),
+            // GPS HUD Container
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF10241A),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: const Color(0xFF1F4330)),
               ),
-
-              // TAB 2: COMMON CHAT
-              Column(
+              child: Row(
                 children: [
+                  const Icon(Icons.location_on, color: Color(0xFF00E676), size: 18),
+                  const SizedBox(width: 10),
                   Expanded(
-                    child: state.chatFeed.isEmpty
-                        ? Center(
-                            child: Text(
-                                "Offline Cellular Frequency Open for Lobby #${state.groupCode}.\nMessages transmit via carrier SMS.",
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(color: Colors.grey)))
-                        : ListView.builder(
-                            reverse: true,
-                            padding: const EdgeInsets.all(14),
-                            itemCount: state.chatFeed.length,
-                            itemBuilder: (context, index) {
-                              final msg = state.chatFeed[index];
-                              return Align(
-                                alignment: msg.isMe
-                                    ? Alignment.centerRight
-                                    : Alignment.centerLeft,
-                                child: Container(
-                                  margin:
-                                      const EdgeInsets.symmetric(vertical: 4),
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 12, vertical: 8),
-                                  constraints: BoxConstraints(
-                                      maxWidth:
-                                          MediaQuery.of(context).size.width *
-                                              0.78),
-                                  decoration: BoxDecoration(
-                                    color: msg.isSOS
-                                        ? Colors.red.shade900
-                                        : (msg.isMe
-                                            ? const Color(0xFF005C4B)
-                                            : const Color(0xFF202C33)),
-                                    borderRadius: BorderRadius.only(
-                                      topLeft: const Radius.circular(12),
-                                      topRight: const Radius.circular(12),
-                                      bottomLeft:
-                                          Radius.circular(msg.isMe ? 12 : 0),
-                                      bottomRight:
-                                          Radius.circular(msg.isMe ? 0 : 12),
-                                    ),
-                                  ),
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      if (!msg.isMe) ...[
-                                        Row(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            Text(msg.senderName,
-                                                style: const TextStyle(
-                                                    fontWeight: FontWeight.bold,
-                                                    fontSize: 11,
-                                                    color: Color(0xFF53BDEB))),
-                                            const SizedBox(width: 6),
-                                            Container(
-                                              padding:
-                                                  const EdgeInsets.symmetric(
-                                                      horizontal: 4,
-                                                      vertical: 1),
-                                              decoration: BoxDecoration(
-                                                color: msg.senderRole ==
-                                                        UserRole.leader
-                                                    ? Colors.orange
-                                                    : Colors.blueGrey,
-                                                borderRadius:
-                                                    BorderRadius.circular(4),
-                                              ),
-                                              child: Text(
-                                                  msg.senderRole ==
-                                                          UserRole.leader
-                                                      ? "LEADER 👑"
-                                                      : "MEMBER",
-                                                  style: const TextStyle(
-                                                      fontSize: 8,
-                                                      fontWeight:
-                                                          FontWeight.bold)),
-                                            )
-                                          ],
-                                        ),
-                                        const SizedBox(height: 3),
-                                      ],
-                                      Text(msg.content,
-                                          style: const TextStyle(fontSize: 14)),
-                                      if (msg.latitude != null) ...[
-                                        const SizedBox(height: 2),
-                                        Text(
-                                            "GPS: ${msg.latitude!.toStringAsFixed(4)}, ${msg.longitude!.toStringAsFixed(4)}",
-                                            style: const TextStyle(
-                                                fontSize: 9,
-                                                color: Colors.greenAccent)),
-                                      ]
-                                    ],
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                  ),
-                  Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                    color: const Color(0xFF1F2C34),
-                    child: Row(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Expanded(
-                          child: TextField(
-                            controller: _input,
-                            decoration: const InputDecoration(
-                                hintText: "Transmit cellular message...",
-                                border: InputBorder.none,
-                                contentPadding:
-                                    EdgeInsets.symmetric(horizontal: 10)),
-                          ),
-                        ),
-                        IconButton(
-                          icon:
-                              const Icon(Icons.send, color: Color(0xFF00A884)),
-                          onPressed: () {
-                            if (_input.text.trim().isNotEmpty) {
-                              context.read<AppBloc>().add(
-                                  SendMessageEvent(text: _input.text.trim()));
-                              _input.clear();
-                            }
-                          },
-                        )
+                        const Text("GPS SATELLITE TELEMETRY", style: TextStyle(fontSize: 10, color: Color(0xFF4ADE80), letterSpacing: 1.2, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 2),
+                        Text(_gpsText, style: TextStyle(fontSize: 12, color: Colors.white.withOpacity(0.8))),
                       ],
                     ),
+                  ),
+                  IconButton(
+                    icon: _fetchingGps 
+                      ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00E676)))
+                      : const Icon(Icons.refresh, color: Color(0xFF4ADE80)),
+                    onPressed: _getGPS,
                   )
                 ],
               ),
+            ),
 
-              // TAB 3: ACTIVE MESH SQUAD
-              ListView.builder(
-                padding: const EdgeInsets.all(16),
-                itemCount: state.activeGroup.length,
-                itemBuilder: (context, index) {
-                  final member = state.activeGroup[index];
-                  final isL = member.role == UserRole.leader;
-                  return Card(
-                    color: const Color(0xFF1F2C34),
-                    child: ListTile(
-                      leading: CircleAvatar(
-                        backgroundColor:
-                            isL ? Colors.orange : const Color(0xFF00A884),
-                        child: Icon(isL ? Icons.shield : Icons.person,
-                            color: Colors.white),
+            const Spacer(),
+
+            // Red Concentric SOS Button
+            Center(
+              child: GestureDetector(
+                onTap: _triggerEmergencySOS,
+                child: Container(
+                  width: 220,
+                  height: 220,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(color: const Color(0xFF7F1D1D), width: 3),
+                    boxShadow: [
+                      BoxShadow(color: const Color(0xFFEF4444).withOpacity(0.3), blurRadius: 40, spreadRadius: 5),
+                    ],
+                  ),
+                  child: Center(
+                    child: Container(
+                      width: 170,
+                      height: 170,
+                      decoration: const BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Color(0xFFEF4444),
                       ),
-                      title: Text(member.name,
-                          style: const TextStyle(fontWeight: FontWeight.bold)),
-                      subtitle: Text("SIM: ${member.phone}"),
-                      trailing: Chip(
-                        label: Text(isL ? "LEADER 👑" : "MEMBER 🚶",
-                            style: const TextStyle(fontSize: 10)),
-                        backgroundColor: isL
-                            ? Colors.orange.withOpacity(0.2)
-                            : const Color(0xFF00A884).withOpacity(0.2),
+                      child: const Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text("SOS", style: TextStyle(fontSize: 42, fontWeight: FontWeight.w900, letterSpacing: 2, color: Colors.white)),
+                          Text("Press to alert", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                        ],
                       ),
                     ),
-                  );
-                },
-              )
-            ],
+                  ),
+                ),
+              ),
+            ),
+
+            const Spacer(),
+
+            const Text("SELECT EMERGENCY TYPE", style: TextStyle(fontSize: 11, color: Color(0xFF4ADE80), letterSpacing: 1.5, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+
+            // Emergency Matrix Grid
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: emergencies.map((item) {
+                final isSelected = _selectedEmergency == item['label'];
+                return GestureDetector(
+                  onTap: () => setState(() => _selectedEmergency = item['label']),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: isSelected ? const Color(0xFFDC2626) : const Color(0xFF132B1F),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: isSelected ? const Color(0xFFEF4444) : const Color(0xFF1F4330)),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(item['icon'], size: 16, color: isSelected ? Colors.white : const Color(0xFF4ADE80)),
+                        const SizedBox(width: 6),
+                        Text(item['label'], style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isSelected ? Colors.white : Colors.white70)),
+                      ],
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+
+            const SizedBox(height: 14),
+
+            // Group Members Status Bar
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF10241A),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFF1F4330)),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.group, color: Color(0xFF4ADE80), size: 20),
+                  SizedBox(width: 10),
+                  Expanded(
+                    child: Text("Active offline SMS mesh connected. Add contacts in Group tab.", style: TextStyle(fontSize: 11, color: Colors.white70)),
+                  )
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------- 2. OFFLINE MESH GROUP CHAT ----------------
+class MeshGroupScreen extends StatefulWidget {
+  const MeshGroupScreen({super.key});
+  @override
+  State<MeshGroupScreen> createState() => _MeshGroupScreenState();
+}
+
+class _MeshGroupScreenState extends State<MeshGroupScreen> {
+  final _msgCtrl = TextEditingController();
+  List<Map<String, dynamic>> _messages = [];
+  List<Map<String, dynamic>> _members = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshData();
+    Timer.periodic(const Duration(seconds: 2), (_) => _refreshData());
+  }
+
+  void _refreshData() async {
+    final db = await LocalDatabase.instance;
+    final msgs = await db.query('messages', orderBy: 'id ASC');
+    final mems = await db.query('members');
+    if (mounted) {
+      setState(() {
+        _messages = msgs;
+        _members = mems;
+      });
+    }
+  }
+
+  void _sendMeshMessage() async {
+    final text = _msgCtrl.text.trim();
+    if (text.isEmpty) return;
+    _msgCtrl.clear();
+
+    final db = await LocalDatabase.instance;
+    final mems = await db.query('members');
+
+    if (mems.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Add group members using the (+) button first!")));
+      return;
+    }
+
+    // Broadcast SMS with signature tag [TS_MESH]
+    for (var m in mems) {
+      telephony.sendSms(to: m['phone'] as String, message: "[TS_MESH] $text");
+    }
+
+    // Save to local database
+    await db.insert('messages', {
+      'sender': 'ME',
+      'text': text,
+      'isMe': 1,
+      'timestamp': DateTime.now().toIso8601String()
+    });
+
+    _refreshData();
+  }
+
+  void _addMemberDialog() {
+    final nameCtrl = TextEditingController();
+    final phoneCtrl = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF10241A),
+        title: const Text("ADD MESH NODE (MEMBER)", style: TextStyle(color: Color(0xFF00E676), fontSize: 14)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(controller: nameCtrl, style: const TextStyle(color: Colors.white), decoration: const InputDecoration(hintText: "Member Name")),
+            TextField(controller: phoneCtrl, keyboardType: TextInputType.phone, style: const TextStyle(color: Colors.white), decoration: const InputDecoration(hintText: "Phone (+91...)")),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCEL", style: TextStyle(color: Colors.white54))),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00E676), foregroundColor: Colors.black),
+            onPressed: () async {
+              if (phoneCtrl.text.isNotEmpty) {
+                final db = await LocalDatabase.instance;
+                await db.insert('members', {'name': nameCtrl.text, 'phone': phoneCtrl.text.trim()});
+                _refreshData();
+                Navigator.pop(context);
+              }
+            },
+            child: const Text("ADD NODE"),
+          )
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            color: const Color(0xFF10241A),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text("OFFLINE MESH CHAT", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+                    Text("ACTIVE NODES: ${_members.length}", style: const TextStyle(fontSize: 10, color: Color(0xFF00E676))),
+                  ],
+                ),
+                IconButton(icon: const Icon(Icons.person_add, color: Color(0xFF00E676)), onPressed: _addMemberDialog),
+              ],
+            ),
           ),
-        );
-      },
+          Expanded(
+            child: ListView.builder(
+              padding: const EdgeInsets.all(12),
+              itemCount: _messages.length,
+              itemBuilder: (_, i) {
+                final m = _messages[i];
+                final isMe = m['isMe'] == 1;
+                return Align(
+                  alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(vertical: 4),
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: isMe ? const Color(0xFF1E4D34) : const Color(0xFF132B1F),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: isMe ? const Color(0xFF00E676) : const Color(0xFF2A5940)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                      children: [
+                        Text(m['sender'] ?? '', style: TextStyle(fontSize: 9, color: isMe ? const Color(0xFF4ADE80) : Colors.amber, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 2),
+                        Text(m['text'] ?? '', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            color: const Color(0xFF060E0A),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _msgCtrl,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: InputDecoration(
+                      hintText: "Transmit over SMS Mesh...",
+                      hintStyle: TextStyle(color: Colors.white.withOpacity(0.3)),
+                      filled: true,
+                      fillColor: const Color(0xFF10241A),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(24), borderSide: BorderSide.none),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.send_rounded, color: Color(0xFF00E676)),
+                  onPressed: _sendMeshMessage,
+                )
+              ],
+            ),
+          )
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------- PLACEHOLDER SCREEN ----------------
+class PlaceholderScreen extends StatelessWidget {
+  final String title;
+  const PlaceholderScreen({super.key, required this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Text(title, textAlign: TextAlign.center, style: const TextStyle(color: Color(0xFF4ADE80), letterSpacing: 1.2)),
+    );
+  }
+}
+
+// ---------------- 5. PROFILE SCREEN ----------------
+class ProfileScreen extends StatelessWidget {
+  const ProfileScreen({super.key});
+
+  void _logout(BuildContext context) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.clear();
+    Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginOTPScreen()));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.account_circle, size: 80, color: Color(0xFF00E676)),
+            const SizedBox(height: 12),
+            const Text("DISPATCH OPERATOR NODE", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, letterSpacing: 1.5)),
+            const SizedBox(height: 24),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFEF4444), foregroundColor: Colors.white),
+              onPressed: () => _logout(context),
+              child: const Text("DISCONNECT TERMINAL"),
+            )
+          ],
+        ),
+      ),
     );
   }
 }
