@@ -26,18 +26,13 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Build TrailSafe Release APK
+      - name: Prepare Native Android Config & Permissions
         run: |
-          # 1. Create a fresh Flutter project
-          flutter create --org com.trailsafe --project-name trailsafe /tmp/app
+          # 1. Ensure android native skeleton exists for your project without overwriting lib/
+          flutter create --platforms=android --org com.trailsafe .
 
-          # 2. Copy source code & pubspec
-          cp pubspec.yaml /tmp/app/pubspec.yaml
-          rm -rf /tmp/app/lib
-          cp -r lib /tmp/app/lib
-
-          # 3. Inject Manifest with all permissions
-          cat << 'EOF' > /tmp/app/android/app/src/main/AndroidManifest.xml
+          # 2. Inject your original offline & mesh permissions into AndroidManifest.xml
+          cat << 'EOF' > android/app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
@@ -65,8 +60,7 @@ jobs:
                       android:windowSoftInputMode="adjustResize">
                       <meta-data
                         android:name="io.flutter.embedding.android.NormalTheme"
-                        android:resource="@style/NormalTheme"
-                        />
+                        android:resource="@style/NormalTheme" />
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN"/>
                           <category android:name="android.intent.category.LAUNCHER"/>
@@ -79,28 +73,23 @@ jobs:
           </manifest>
           EOF
 
-          # 4. Add warning validation flags to gradle.properties
-          cat << 'EOF' >> /tmp/app/android/gradle.properties
+          # 3. Add gradle flags to prevent build crashes
+          cat << 'EOF' >> android/gradle.properties
           kotlin.jvm.target.validation.mode=warning
           android.useAndroidX=true
           android.enableJetifier=true
           EOF
 
-          # 5. Fetch packages and patch legacy plugin compileSdk versions directly in pub-cache
-          cd /tmp/app
+      - name: Install Dependencies & Patch Plugins
+        run: |
           flutter pub get
-
-          # Upgrade compileSdk 30 -> 34 in all cached plugins (fixes flutter_vibrate metadata crash)
+          # Fix legacy compileSdkVersion 30 in flutter_vibrate and other cached plugins
           find /home/runner/.pub-cache -name "build.gradle" -exec sed -i 's/compileSdkVersion 30/compileSdkVersion 34/g' {} +
           find /home/runner/.pub-cache -name "build.gradle" -exec sed -i 's/compileSdkVersion 29/compileSdkVersion 34/g' {} +
           find /home/runner/.pub-cache -name "build.gradle" -exec sed -i 's/compileSdkVersion 28/compileSdkVersion 34/g' {} +
 
-          # 6. Build Release APK
-          flutter build apk --release
-
-          # 7. Copy output binary for GitHub Actions upload
-          mkdir -p $GITHUB_WORKSPACE/build/app/outputs/flutter-apk
-          cp build/app/outputs/flutter-apk/app-release.apk $GITHUB_WORKSPACE/build/app/outputs/flutter-apk/
+      - name: Build TrailSafe Release APK
+        run: flutter build apk --release
 
       - name: Upload Finished APK
         uses: actions/upload-artifact@v4
