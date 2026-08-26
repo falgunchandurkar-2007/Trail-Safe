@@ -10,7 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 final Telephony telephony = Telephony.instance;
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
-// Helper to sanitize phone numbers (removes spaces, +, leading 0, etc.)
+// Helper to sanitize phone numbers (removes country codes, spaces, +, etc.)
 String normalizePhone(String phone) {
   String digits = phone.replaceAll(RegExp(r'\D'), '');
   if (digits.length > 10) {
@@ -19,7 +19,7 @@ String normalizePhone(String phone) {
   return digits;
 }
 
-// Global SOS Alert Trigger
+// Global High-Priority Emergency Alert Modal
 void triggerGlobalEmergencyAlert(String senderInfo, String alertText) {
   final context = appNavigatorKey.currentContext;
   if (context != null) {
@@ -93,7 +93,7 @@ void backgroundMessageHandler(SmsMessage message) async {
     final prefs = await SharedPreferences.getInstance();
     final myPhone = prefs.getString('user_phone') ?? "";
 
-    // Ignore self messages
+    // Ignore self-sent loopback messages
     if (normalizePhone(sender) == normalizePhone(myPhone) && myPhone.isNotEmpty) {
       return;
     }
@@ -411,7 +411,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
 
           await prefs.setStringList('mesh_chat_history', rawMsgs);
 
-          // Check for SOS Alert and trigger modal on any screen
+          // Check for SOS Alert and trigger modal immediately
           if (cleanText.contains("SOS ALERT")) {
             SystemSound.play(SystemSoundType.alert);
             HapticFeedback.heavyImpact();
@@ -531,7 +531,7 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
       return;
     }
 
-    // Send SOS ONLY to peer devices (Never send SMS to self)
+    // Send SOS ONLY to peer devices (Skips self phone number)
     for (var m in members) {
       final decoded = jsonDecode(m);
       final memberPhone = decoded['phone']?.toString() ?? '';
@@ -994,7 +994,7 @@ class _MeshGroupChatScreenState extends State<MeshGroupChatScreen> {
     final myName = prefs.getString('user_name') ?? 'Me';
     List<String> rawMems = prefs.getStringList('room_members') ?? [];
 
-    // Broadcast SMS ONLY to peer devices (Skips sending SMS to self to avoid charges & loopback)
+    // Broadcast SMS ONLY to peer devices (Skips self phone number)
     for (var m in rawMems) {
       final decoded = jsonDecode(m);
       final memberPhone = decoded['phone']?.toString() ?? '';
