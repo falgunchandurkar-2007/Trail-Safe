@@ -10,7 +10,80 @@ import 'package:shared_preferences/shared_preferences.dart';
 final Telephony telephony = Telephony.instance;
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
-// Background SMS Listener for incoming mesh packets
+// Helper to sanitize phone numbers (removes spaces, +, leading 0, etc.)
+String normalizePhone(String phone) {
+  String digits = phone.replaceAll(RegExp(r'\D'), '');
+  if (digits.length > 10) {
+    return digits.substring(digits.length - 10);
+  }
+  return digits;
+}
+
+// Global SOS Alert Trigger
+void triggerGlobalEmergencyAlert(String senderInfo, String alertText) {
+  final context = appNavigatorKey.currentContext;
+  if (context != null) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogCtx) {
+        return Dialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          backgroundColor: Colors.white,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: const [
+                    Icon(Icons.warning_rounded, color: Color(0xFFDC2626), size: 30),
+                    SizedBox(width: 10),
+                    Text(
+                      "Emergency alert",
+                      style: TextStyle(
+                        color: Colors.black87,
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        fontFamily: 'sans-serif',
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  "Alert received from $senderInfo:\n\n$alertText\n\nImmediate assistance required.",
+                  style: const TextStyle(
+                    color: Colors.black87,
+                    fontSize: 14,
+                    height: 1.4,
+                    fontFamily: 'sans-serif',
+                  ),
+                ),
+                const SizedBox(height: 22),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFDC2626),
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    onPressed: () => Navigator.pop(dialogCtx),
+                    child: const Text("ACKNOWLEDGE", style: TextStyle(fontWeight: FontWeight.bold, fontFamily: 'sans-serif')),
+                  ),
+                )
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// Background SMS Listener
 @pragma('vm:entry-point')
 void backgroundMessageHandler(SmsMessage message) async {
   final body = message.body ?? "";
@@ -20,15 +93,14 @@ void backgroundMessageHandler(SmsMessage message) async {
     final prefs = await SharedPreferences.getInstance();
     final myPhone = prefs.getString('user_phone') ?? "";
 
-    // DROP duplicate loopback if message originated from current device
-    if (sender.isNotEmpty && myPhone.isNotEmpty && sender.contains(myPhone.replaceAll("+", ""))) {
+    // Ignore self messages
+    if (normalizePhone(sender) == normalizePhone(myPhone) && myPhone.isNotEmpty) {
       return;
     }
 
     List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
     final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
-    
-    // Check if it's a join notification broadcast
+
     if (cleanText.startsWith("EVENT_JOIN:")) {
       final joinedName = cleanText.replaceFirst("EVENT_JOIN:", "").trim();
       rawMsgs.add(jsonEncode({
@@ -38,9 +110,9 @@ void backgroundMessageHandler(SmsMessage message) async {
         'isSystem': true,
         'timestamp': DateTime.now().toIso8601String()
       }));
-      // Auto-save member to room contact list if new
+
       List<String> rawMems = prefs.getStringList('room_members') ?? [];
-      bool exists = rawMems.any((m) => (jsonDecode(m)['phone'] as String) == sender);
+      bool exists = rawMems.any((m) => normalizePhone(jsonDecode(m)['phone'] ?? '') == normalizePhone(sender));
       if (!exists) {
         rawMems.add(jsonEncode({'name': joinedName, 'phone': sender}));
         await prefs.setStringList('room_members', rawMems);
@@ -117,7 +189,7 @@ class _AuthGateScreenState extends State<AuthGateScreen> {
   }
 }
 
-// ---------------- LOGIN WITH NAME & OTP SCREEN ----------------
+// ---------------- LOGIN SCREEN ----------------
 class LoginRegistrationScreen extends StatefulWidget {
   const LoginRegistrationScreen({super.key});
   @override
@@ -202,8 +274,6 @@ class _LoginRegistrationScreenState extends State<LoginRegistrationScreen> {
                 const Text("TRAILSAFE TERMINAL", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, letterSpacing: 2, color: Colors.white)),
                 const Text("IDENTITY VERIFICATION GATEWAY", style: TextStyle(fontSize: 10, color: Color(0xFF00E676), letterSpacing: 1.5)),
                 const SizedBox(height: 30),
-
-                // Name Input Field
                 TextField(
                   controller: _nameCtrl,
                   style: const TextStyle(color: Colors.white),
@@ -217,8 +287,6 @@ class _LoginRegistrationScreenState extends State<LoginRegistrationScreen> {
                   ),
                 ),
                 const SizedBox(height: 12),
-
-                // Phone Input Field
                 TextField(
                   controller: _phoneCtrl,
                   keyboardType: TextInputType.phone,
@@ -232,7 +300,6 @@ class _LoginRegistrationScreenState extends State<LoginRegistrationScreen> {
                     border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
                   ),
                 ),
-
                 if (isOtpSent) ...[
                   const SizedBox(height: 14),
                   TextField(
@@ -249,7 +316,6 @@ class _LoginRegistrationScreenState extends State<LoginRegistrationScreen> {
                     ),
                   ),
                 ],
-
                 const SizedBox(height: 22),
                 SizedBox(
                   width: double.infinity,
@@ -292,6 +358,74 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     const HospitalRadarScreen(),
     const UserProfileDetailsScreen(),
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    _startGlobalSmsListener();
+  }
+
+  void _startGlobalSmsListener() async {
+    await telephony.requestPhoneAndSmsPermissions;
+    telephony.listenIncomingSms(
+      onNewMessage: (SmsMessage msg) async {
+        final body = msg.body ?? "";
+        final sender = msg.address ?? "Unknown";
+        final prefs = await SharedPreferences.getInstance();
+        final myPhone = prefs.getString('user_phone') ?? "";
+
+        // Prevent self loopback duplication
+        if (normalizePhone(sender) == normalizePhone(myPhone) && myPhone.isNotEmpty) {
+          return;
+        }
+
+        if (body.startsWith("[TS_MESH]")) {
+          final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
+          List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
+
+          if (cleanText.startsWith("EVENT_JOIN:")) {
+            final joinedName = cleanText.replaceFirst("EVENT_JOIN:", "").trim();
+            rawMsgs.add(jsonEncode({
+              'sender': 'SYSTEM',
+              'text': '⚡ $joinedName has entered the room.',
+              'isMe': false,
+              'isSystem': true,
+              'timestamp': DateTime.now().toIso8601String()
+            }));
+
+            List<String> rawMems = prefs.getStringList('room_members') ?? [];
+            bool exists = rawMems.any((m) => normalizePhone(jsonDecode(m)['phone'] ?? '') == normalizePhone(sender));
+            if (!exists) {
+              rawMems.add(jsonEncode({'name': joinedName, 'phone': sender}));
+              await prefs.setStringList('room_members', rawMems);
+            }
+          } else {
+            rawMsgs.add(jsonEncode({
+              'sender': sender,
+              'text': cleanText,
+              'isMe': false,
+              'isSystem': false,
+              'timestamp': DateTime.now().toIso8601String()
+            }));
+          }
+
+          await prefs.setStringList('mesh_chat_history', rawMsgs);
+
+          // Check for SOS Alert and trigger modal on any screen
+          if (cleanText.contains("SOS ALERT")) {
+            SystemSound.play(SystemSoundType.alert);
+            HapticFeedback.heavyImpact();
+            triggerGlobalEmergencyAlert(sender, cleanText);
+          } else {
+            SystemSound.play(SystemSoundType.alert);
+            HapticFeedback.vibrate();
+          }
+        }
+      },
+      onBackgroundMessage: backgroundMessageHandler,
+      listenInBackground: true,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -345,7 +479,6 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
   @override
   void initState() {
     super.initState();
-    _initSMSListener();
     _getGPS();
     _loadRoomStatus();
   }
@@ -355,138 +488,6 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
     setState(() {
       _activeRoomCode = prefs.getString('current_room_code') ?? "NO ACTIVE ROOM";
     });
-  }
-
-  void _initSMSListener() async {
-    await telephony.requestPhoneAndSmsPermissions;
-    telephony.listenIncomingSms(
-      onNewMessage: (SmsMessage msg) async {
-        final body = msg.body ?? "";
-        final sender = msg.address ?? "Unknown";
-        final prefs = await SharedPreferences.getInstance();
-        final myPhone = prefs.getString('user_phone') ?? "";
-
-        // Drop incoming self-sent loopbacks
-        if (sender.isNotEmpty && myPhone.isNotEmpty && sender.contains(myPhone.replaceAll("+", ""))) {
-          return;
-        }
-
-        if (body.startsWith("[TS_MESH]")) {
-          final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
-          List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
-
-          if (cleanText.startsWith("EVENT_JOIN:")) {
-            final joinedName = cleanText.replaceFirst("EVENT_JOIN:", "").trim();
-            rawMsgs.add(jsonEncode({
-              'sender': 'SYSTEM',
-              'text': '⚡ $joinedName has entered the room.',
-              'isMe': false,
-              'isSystem': true,
-              'timestamp': DateTime.now().toIso8601String()
-            }));
-            
-            List<String> rawMems = prefs.getStringList('room_members') ?? [];
-            bool exists = rawMems.any((m) => (jsonDecode(m)['phone'] as String) == sender);
-            if (!exists) {
-              rawMems.add(jsonEncode({'name': joinedName, 'phone': sender}));
-              await prefs.setStringList('room_members', rawMems);
-            }
-          } else {
-            rawMsgs.add(jsonEncode({
-              'sender': sender,
-              'text': cleanText,
-              'isMe': false,
-              'isSystem': false,
-              'timestamp': DateTime.now().toIso8601String()
-            }));
-          }
-
-          await prefs.setStringList('mesh_chat_history', rawMsgs);
-
-          // If payload is an Emergency SOS Alert, show high priority popup
-          if (cleanText.contains("SOS ALERT")) {
-            SystemSound.play(SystemSoundType.alert);
-            HapticFeedback.heavyImpact();
-            _showEmergencyPopup(sender, cleanText);
-          } else {
-            SystemSound.play(SystemSoundType.alert);
-            HapticFeedback.vibrate();
-
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  backgroundColor: const Color(0xFF132B1F),
-                  content: Text("🚨 Signal from $sender: $cleanText", style: const TextStyle(color: Color(0xFF00E676))),
-                ),
-              );
-            }
-          }
-        }
-      },
-      onBackgroundMessage: backgroundMessageHandler,
-      listenInBackground: true,
-    );
-  }
-
-  void _showEmergencyPopup(String senderPhone, String alertText) {
-    final ctx = appNavigatorKey.currentContext ?? context;
-    showDialog(
-      context: ctx,
-      barrierDismissible: false,
-      builder: (dialogCtx) {
-        return Dialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          backgroundColor: Colors.white,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: const [
-                    Icon(Icons.warning_rounded, color: Color(0xFFDC2626), size: 30),
-                    SizedBox(width: 10),
-                    Text(
-                      "Emergency alert",
-                      style: TextStyle(
-                        color: Colors.black87,
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
-                        fontFamily: 'sans-serif',
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 14),
-                Text(
-                  "Alert received from $senderPhone:\n\n$alertText\n\nImmediate assistance required.",
-                  style: const TextStyle(
-                    color: Colors.black87,
-                    fontSize: 14,
-                    height: 1.4,
-                    fontFamily: 'sans-serif',
-                  ),
-                ),
-                const SizedBox(height: 22),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFFDC2626),
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                    ),
-                    onPressed: () => Navigator.pop(dialogCtx),
-                    child: const Text("ACKNOWLEDGE", style: TextStyle(fontWeight: FontWeight.bold, fontFamily: 'sans-serif')),
-                  ),
-                )
-              ],
-            ),
-          ),
-        );
-      },
-    );
   }
 
   void _getGPS() async {
@@ -514,11 +515,12 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
 
     final prefs = await SharedPreferences.getInstance();
     final myName = prefs.getString('user_name') ?? 'Trekker';
+    final myPhone = prefs.getString('user_phone') ?? '';
     List<String> members = prefs.getStringList('room_members') ?? [];
 
-    String coords = _currentPosition != null 
-      ? "https://maps.google.com/?q=${_currentPosition!.latitude},${_currentPosition!.longitude}"
-      : "GPS Satellite Fix";
+    String coords = _currentPosition != null
+        ? "https://maps.google.com/?q=${_currentPosition!.latitude},${_currentPosition!.longitude}"
+        : "GPS Satellite Fix";
 
     String payload = "[TS_MESH] 🚨 SOS ALERT from $myName: $_selectedEmergency! Location: $coords";
 
@@ -529,16 +531,16 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
       return;
     }
 
-    final myPhone = prefs.getString('user_phone') ?? '';
-
-    // Broadcast SMS to all peer nodes EXCEPT current device
+    // Send SOS ONLY to peer devices (Never send SMS to self)
     for (var m in members) {
       final decoded = jsonDecode(m);
-      if (decoded['phone'] != myPhone) {
-        telephony.sendSms(to: decoded['phone'], message: payload);
+      final memberPhone = decoded['phone']?.toString() ?? '';
+      if (normalizePhone(memberPhone) != normalizePhone(myPhone) && memberPhone.isNotEmpty) {
+        telephony.sendSms(to: memberPhone, message: payload);
       }
     }
 
+    // Append to local chat only once
     List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
     rawMsgs.add(jsonEncode({
       'sender': 'ME (SOS)',
@@ -551,9 +553,9 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: const Color(0xFFEF4444),
-          content: Text("⚡ SOS DISPATCHED TO REGISTERED MEMBERS", style: const TextStyle(fontWeight: FontWeight.bold)),
+        const SnackBar(
+          backgroundColor: Color(0xFFEF4444),
+          content: Text("⚡ SOS DISPATCHED TO REGISTERED PEER NODES", style: TextStyle(fontWeight: FontWeight.bold)),
         ),
       );
     }
@@ -583,8 +585,6 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
               ],
             ),
             const SizedBox(height: 14),
-
-            // GPS Status Box
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
               decoration: BoxDecoration(
@@ -607,18 +607,15 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
                     ),
                   ),
                   IconButton(
-                    icon: _fetchingGps 
-                      ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00E676)))
-                      : const Icon(Icons.refresh, color: Color(0xFF4ADE80)),
+                    icon: _fetchingGps
+                        ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00E676)))
+                        : const Icon(Icons.refresh, color: Color(0xFF4ADE80)),
                     onPressed: _getGPS,
                   )
                 ],
               ),
             ),
-
             const Spacer(),
-
-            // Red Circular SOS
             Center(
               child: GestureDetector(
                 onTap: _triggerEmergencySOS,
@@ -652,12 +649,9 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
                 ),
               ),
             ),
-
             const Spacer(),
-
             const Text("SELECT EMERGENCY TYPE", style: TextStyle(fontSize: 11, color: Color(0xFF4ADE80), letterSpacing: 1.5, fontWeight: FontWeight.bold)),
             const SizedBox(height: 12),
-
             Wrap(
               spacing: 8,
               runSpacing: 8,
@@ -687,9 +681,7 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
                 );
               }).toList(),
             ),
-
             const SizedBox(height: 14),
-
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
               decoration: BoxDecoration(
@@ -714,7 +706,7 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
   }
 }
 
-// ---------------- 2. HOST / JOIN ROOM HUB SCREEN ----------------
+// ---------------- 2. ROOM HUB SCREEN ----------------
 class RoomHubScreen extends StatefulWidget {
   const RoomHubScreen({super.key});
   @override
@@ -746,8 +738,7 @@ class _RoomHubScreenState extends State<RoomHubScreen> {
     final code = "TRK-${1000 + Random().nextInt(9000)}";
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('current_room_code', code);
-    
-    // Add Host to room members
+
     final myName = prefs.getString('user_name') ?? 'Host';
     final myPhone = prefs.getString('user_phone') ?? '';
     List<String> mems = [jsonEncode({'name': myName, 'phone': myPhone, 'role': 'HOST'})];
@@ -771,18 +762,19 @@ class _RoomHubScreenState extends State<RoomHubScreen> {
     final myName = prefs.getString('user_name') ?? 'Trekker';
     await prefs.setString('current_room_code', roomCode);
 
-    // Save Host to local room members
     List<String> rawMems = prefs.getStringList('room_members') ?? [];
-    rawMems.add(jsonEncode({'name': 'Host / Peer', 'phone': hostPhone}));
-    await prefs.setStringList('room_members', rawMems);
+    bool exists = rawMems.any((m) => normalizePhone(jsonDecode(m)['phone'] ?? '') == normalizePhone(hostPhone));
+    if (!exists) {
+      rawMems.add(jsonEncode({'name': 'Host / Peer', 'phone': hostPhone}));
+      await prefs.setStringList('room_members', rawMems);
+    }
 
-    // Broadcast Join Notification to the Host via SMS
+    // Broadcast join via SMS to host
     telephony.sendSms(
       to: hostPhone,
       message: "[TS_MESH] EVENT_JOIN: $myName",
     );
 
-    // Log in local chat
     List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
     rawMsgs.add(jsonEncode({
       'sender': 'SYSTEM',
@@ -845,8 +837,6 @@ class _RoomHubScreenState extends State<RoomHubScreen> {
           children: [
             const Text("ROOM LOBBY & NODES", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
             const SizedBox(height: 12),
-
-            // Active Room Card
             Container(
               padding: const EdgeInsets.all(14),
               decoration: BoxDecoration(
@@ -873,10 +863,7 @@ class _RoomHubScreenState extends State<RoomHubScreen> {
                 ],
               ),
             ),
-
             const SizedBox(height: 16),
-
-            // Join Room Section
             Container(
               padding: const EdgeInsets.all(14),
               decoration: BoxDecoration(
@@ -913,9 +900,7 @@ class _RoomHubScreenState extends State<RoomHubScreen> {
                 ],
               ),
             ),
-
             const SizedBox(height: 16),
-
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
@@ -923,38 +908,37 @@ class _RoomHubScreenState extends State<RoomHubScreen> {
                 IconButton(icon: const Icon(Icons.person_add, color: Color(0xFF00E676)), onPressed: _addManualMember),
               ],
             ),
-
             Expanded(
               child: _roomMembers.isEmpty
-                ? const Center(child: Text("No registered members yet. Host, join, or add nodes above.", style: TextStyle(color: Colors.white38, fontSize: 11)))
-                : ListView.builder(
-                    itemCount: _roomMembers.length,
-                    itemBuilder: (_, i) {
-                      final m = _roomMembers[i];
-                      return Container(
-                        margin: const EdgeInsets.symmetric(vertical: 4),
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF10241A),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(color: const Color(0xFF1F4330)),
-                        ),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(m['name'] ?? 'Unknown', style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
-                                Text(m['phone'] ?? '', style: const TextStyle(fontSize: 11, color: Color(0xFF4ADE80))),
-                              ],
-                            ),
-                            const Icon(Icons.check_circle, color: Color(0xFF00E676), size: 18),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
+                  ? const Center(child: Text("No registered members yet. Host, join, or add nodes above.", style: TextStyle(color: Colors.white38, fontSize: 11)))
+                  : ListView.builder(
+                      itemCount: _roomMembers.length,
+                      itemBuilder: (_, i) {
+                        final m = _roomMembers[i];
+                        return Container(
+                          margin: const EdgeInsets.symmetric(vertical: 4),
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF10241A),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: const Color(0xFF1F4330)),
+                          ),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(m['name'] ?? 'Unknown', style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+                                  Text(m['phone'] ?? '', style: const TextStyle(fontSize: 11, color: Color(0xFF4ADE80))),
+                                ],
+                              ),
+                              const Icon(Icons.check_circle, color: Color(0xFF00E676), size: 18),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
             )
           ],
         ),
@@ -974,21 +958,24 @@ class _MeshGroupChatScreenState extends State<MeshGroupChatScreen> {
   final _msgCtrl = TextEditingController();
   List<Map<String, dynamic>> _messages = [];
   List<Map<String, dynamic>> _members = [];
+  String _myPhone = "";
 
   @override
   void initState() {
     super.initState();
     _refreshChat();
-    Timer.periodic(const Duration(seconds: 2), (_) => _refreshChat());
+    Timer.periodic(const Duration(milliseconds: 1500), (_) => _refreshChat());
   }
 
   void _refreshChat() async {
     final prefs = await SharedPreferences.getInstance();
     List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
     List<String> rawMems = prefs.getStringList('room_members') ?? [];
+    final phone = prefs.getString('user_phone') ?? "";
 
     if (mounted) {
       setState(() {
+        _myPhone = phone;
         _messages = rawMsgs.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
         _members = rawMems.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
       });
@@ -1005,8 +992,18 @@ class _MeshGroupChatScreenState extends State<MeshGroupChatScreen> {
 
     final prefs = await SharedPreferences.getInstance();
     final myName = prefs.getString('user_name') ?? 'Me';
+    List<String> rawMems = prefs.getStringList('room_members') ?? [];
 
-    // Save only to local database / state (DO NOT SEND EXTERNAL SMS FOR REGULAR CHAT)
+    // Broadcast SMS ONLY to peer devices (Skips sending SMS to self to avoid charges & loopback)
+    for (var m in rawMems) {
+      final decoded = jsonDecode(m);
+      final memberPhone = decoded['phone']?.toString() ?? '';
+      if (normalizePhone(memberPhone) != normalizePhone(_myPhone) && memberPhone.isNotEmpty) {
+        telephony.sendSms(to: memberPhone, message: "[TS_MESH] $myName: $text");
+      }
+    }
+
+    // Save only 1 copy to local chat history for the sender
     List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
     rawMsgs.add(jsonEncode({
       'sender': myName,
@@ -1042,57 +1039,55 @@ class _MeshGroupChatScreenState extends State<MeshGroupChatScreen> {
               ],
             ),
           ),
-
           Expanded(
             child: _messages.isEmpty
-              ? const Center(child: Text("No messages yet. Send an offline text to all room members!", style: TextStyle(color: Colors.white38, fontSize: 11)))
-              : ListView.builder(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: _messages.length,
-                  itemBuilder: (_, i) {
-                    final m = _messages[i];
-                    final isMe = m['isMe'] == true;
-                    final isSystem = m['isSystem'] == true;
+                ? const Center(child: Text("No messages yet. Send an offline text to all room members!", style: TextStyle(color: Colors.white38, fontSize: 11)))
+                : ListView.builder(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: _messages.length,
+                    itemBuilder: (_, i) {
+                      final m = _messages[i];
+                      final isMe = m['isMe'] == true;
+                      final isSystem = m['isSystem'] == true;
 
-                    if (isSystem) {
-                      return Center(
-                        child: Container(
-                          margin: const EdgeInsets.symmetric(vertical: 6),
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF132B1F),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: const Color(0xFF00E676).withOpacity(0.3)),
+                      if (isSystem) {
+                        return Center(
+                          child: Container(
+                            margin: const EdgeInsets.symmetric(vertical: 6),
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF132B1F),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: const Color(0xFF00E676).withOpacity(0.3)),
+                            ),
+                            child: Text(m['text'] ?? '', style: const TextStyle(fontSize: 10, color: Color(0xFF00E676))),
                           ),
-                          child: Text(m['text'] ?? '', style: const TextStyle(fontSize: 10, color: Color(0xFF00E676))),
+                        );
+                      }
+
+                      return Align(
+                        alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                        child: Container(
+                          margin: const EdgeInsets.symmetric(vertical: 4),
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: isMe ? const Color(0xFF1E4D34) : const Color(0xFF132B1F),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: isMe ? const Color(0xFF00E676) : const Color(0xFF2A5940)),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                            children: [
+                              Text(m['sender'] ?? '', style: TextStyle(fontSize: 9, color: isMe ? const Color(0xFF4ADE80) : Colors.amber, fontWeight: FontWeight.bold)),
+                              const SizedBox(height: 2),
+                              Text(m['text'] ?? '', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                            ],
+                          ),
                         ),
                       );
-                    }
-
-                    return Align(
-                      alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-                      child: Container(
-                        margin: const EdgeInsets.symmetric(vertical: 4),
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                        decoration: BoxDecoration(
-                          color: isMe ? const Color(0xFF1E4D34) : const Color(0xFF132B1F),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(color: isMe ? const Color(0xFF00E676) : const Color(0xFF2A5940)),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-                          children: [
-                            Text(m['sender'] ?? '', style: TextStyle(fontSize: 9, color: isMe ? const Color(0xFF4ADE80) : Colors.amber, fontWeight: FontWeight.bold)),
-                            const SizedBox(height: 2),
-                            Text(m['text'] ?? '', style: const TextStyle(color: Colors.white, fontSize: 13)),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
+                    },
+                  ),
           ),
-
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             color: const Color(0xFF060E0A),
@@ -1248,8 +1243,6 @@ class _UserProfileDetailsScreenState extends State<UserProfileDetailsScreen> {
             Text(_name, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white)),
             Text(_phone, style: const TextStyle(fontSize: 13, color: Color(0xFF4ADE80))),
             const SizedBox(height: 24),
-
-            // Details Container
             Container(
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
@@ -1271,9 +1264,7 @@ class _UserProfileDetailsScreenState extends State<UserProfileDetailsScreen> {
                 ],
               ),
             ),
-
             const Spacer(),
-
             SizedBox(
               width: double.infinity,
               height: 48,
