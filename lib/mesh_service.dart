@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:nearby_connections/nearby_connections.dart';
 import 'package:geolocator/geolocator.dart';
-import '../data/db_helper.dart';
+import 'db_helper.dart';
 import 'sound_service.dart';
 
 class MeshService {
