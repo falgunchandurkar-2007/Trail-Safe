@@ -11,7 +11,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -24,6 +25,10 @@ jobs:
         with:
           channel: 'stable'
           cache: true
+
+      - name: Generate Android Embedding
+        run: |
+          flutter create --platforms=android --org com.trailsafe .
 
       - name: Install Dependencies
         run: flutter pub get
