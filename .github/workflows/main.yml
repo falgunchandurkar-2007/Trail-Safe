@@ -26,7 +26,7 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Recreate Clean Android V2 Skeleton
+      - name: Recreate Clean Android Skeleton
         run: |
           rm -rf android
           flutter create --platforms=android --org com.trailsafe .
@@ -34,11 +34,8 @@ jobs:
           # Inject full offline permissions and configuration into AndroidManifest.xml
           cat << 'EOF' > android/app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <!-- GPS Satellite Fixes -->
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-
-              <!-- Offline P2P Mesh (Wi-Fi Direct & BLE) -->
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -75,6 +72,38 @@ jobs:
                       android:value="2" />
               </application>
           </manifest>
+          EOF
+
+          # Enforce Java & Kotlin JVM target 17 across all subprojects (fixes flutter_vibrate)
+          cat << 'EOF' >> android/app/build.gradle
+
+          android {
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          subprojects {
+              afterEvaluate { project ->
+                  if (project.hasProperty("android")) {
+                      android {
+                          compileOptions {
+                              sourceCompatibility JavaVersion.VERSION_17
+                              targetCompatibility JavaVersion.VERSION_17
+                          }
+                      }
+                  }
+                  tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+                      kotlinOptions {
+                          jvmTarget = '17'
+                      }
+                  }
+              }
+          }
           EOF
 
       - name: Install Dependencies
