@@ -1,7 +1,7 @@
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
-import '../services/mesh_service.dart';
-import '../data/db_helper.dart';
+import 'mesh_service.dart';
+import 'db_helper.dart';
 
 abstract class MeshEvent extends Equatable {
   @override
