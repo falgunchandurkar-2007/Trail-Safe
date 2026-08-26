@@ -26,22 +26,21 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Assemble Full Flutter App Project
+      - name: Build TrailSafe Release APK
         run: |
-          # 1. Create a pristine Flutter app in a temp folder
+          # 1. Create a pristine Flutter app
           flutter create --org com.trailsafe --project-name trailsafe /tmp/app
-          
-          # 2. Copy the generated Android project & configuration over
-          cp -r /tmp/app/android ./
-          
-          # 3. Inject full offline permissions and configuration into AndroidManifest.xml
-          cat << 'EOF' > android/app/src/main/AndroidManifest.xml
+
+          # 2. Copy project files
+          cp pubspec.yaml /tmp/app/pubspec.yaml
+          rm -rf /tmp/app/lib
+          cp -r lib /tmp/app/lib
+
+          # 3. Inject Manifest with all permissions
+          cat << 'EOF' > /tmp/app/android/app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <!-- GPS Satellite Fixes -->
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-
-              <!-- Offline P2P Mesh (Wi-Fi Direct & BLE) -->
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -80,8 +79,8 @@ jobs:
           </manifest>
           EOF
 
-          # 4. Enforce JVM target 17 across all dependencies
-          cat << 'EOF' >> android/app/build.gradle
+          # 4. Enforce JVM 17 compatibility on all plugin modules
+          cat << 'EOF' >> /tmp/app/android/app/build.gradle
 
           android {
               compileOptions {
@@ -112,11 +111,14 @@ jobs:
           }
           EOF
 
-      - name: Install Dependencies
-        run: flutter pub get
+          # 5. Build Release APK
+          cd /tmp/app
+          flutter pub get
+          flutter build apk --release
 
-      - name: Build Release APK
-        run: flutter build apk --release
+          # 6. Copy output back for GitHub Actions artifact upload
+          mkdir -p $GITHUB_WORKSPACE/build/app/outputs/flutter-apk
+          cp build/app/outputs/flutter-apk/app-release.apk $GITHUB_WORKSPACE/build/app/outputs/flutter-apk/
 
       - name: Upload Finished APK
         uses: actions/upload-artifact@v4
