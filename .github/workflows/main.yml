@@ -26,16 +26,22 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Recreate Clean Android Skeleton
+      - name: Assemble Full Flutter App Project
         run: |
-          rm -rf android
-          flutter create --platforms=android --org com.trailsafe .
+          # 1. Create a pristine Flutter app in a temp folder
+          flutter create --org com.trailsafe --project-name trailsafe /tmp/app
           
-          # Inject full offline permissions and configuration into AndroidManifest.xml
+          # 2. Copy the generated Android project & configuration over
+          cp -r /tmp/app/android ./
+          
+          # 3. Inject full offline permissions and configuration into AndroidManifest.xml
           cat << 'EOF' > android/app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <!-- GPS Satellite Fixes -->
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+              <!-- Offline P2P Mesh (Wi-Fi Direct & BLE) -->
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -74,7 +80,7 @@ jobs:
           </manifest>
           EOF
 
-          # Enforce Java & Kotlin JVM target 17 across all subprojects (fixes flutter_vibrate)
+          # 4. Enforce JVM target 17 across all dependencies
           cat << 'EOF' >> android/app/build.gradle
 
           android {
