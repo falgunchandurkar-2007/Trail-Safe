@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'services/mesh_service.dart';
-import 'bloc/mesh_bloc.dart';
+import 'mesh_service.dart';
+import 'mesh_bloc.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
