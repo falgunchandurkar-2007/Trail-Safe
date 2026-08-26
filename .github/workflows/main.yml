@@ -28,7 +28,7 @@ jobs:
 
       - name: Build TrailSafe Release APK
         run: |
-          # 1. Generate fresh Flutter Android project
+          # 1. Create a fresh Flutter project
           flutter create --org com.trailsafe --project-name trailsafe /tmp/app
 
           # 2. Copy source code & pubspec
@@ -36,7 +36,7 @@ jobs:
           rm -rf /tmp/app/lib
           cp -r lib /tmp/app/lib
 
-          # 3. Inject Manifest with all offline/mesh permissions
+          # 3. Inject Manifest with all permissions
           cat << 'EOF' > /tmp/app/android/app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
@@ -79,34 +79,26 @@ jobs:
           </manifest>
           EOF
 
-          # 4. Silence AAR metadata checks and force compileSdk 34 on all subprojects
+          # 4. Add warning validation flags to gradle.properties
           cat << 'EOF' >> /tmp/app/android/gradle.properties
           kotlin.jvm.target.validation.mode=warning
           android.useAndroidX=true
           android.enableJetifier=true
           EOF
 
-          cat << 'EOF' >> /tmp/app/android/build.gradle.kts
-
-          subprojects {
-              afterEvaluate {
-                  if (project.hasProperty("android")) {
-                      val android = project.extensions.getByName("android") as com.android.build.gradle.BaseExtension
-                      android.compileSdkVersion(34)
-                  }
-                  tasks.matching { it.name.contains("AarMetadata") }.configureEach {
-                      enabled = false
-                  }
-              }
-          }
-          EOF
-
-          # 5. Build Release APK
+          # 5. Fetch packages and patch legacy plugin compileSdk versions directly in pub-cache
           cd /tmp/app
           flutter pub get
+
+          # Upgrade compileSdk 30 -> 34 in all cached plugins (fixes flutter_vibrate metadata crash)
+          find /home/runner/.pub-cache -name "build.gradle" -exec sed -i 's/compileSdkVersion 30/compileSdkVersion 34/g' {} +
+          find /home/runner/.pub-cache -name "build.gradle" -exec sed -i 's/compileSdkVersion 29/compileSdkVersion 34/g' {} +
+          find /home/runner/.pub-cache -name "build.gradle" -exec sed -i 's/compileSdkVersion 28/compileSdkVersion 34/g' {} +
+
+          # 6. Build Release APK
           flutter build apk --release
 
-          # 6. Copy binary for artifact upload
+          # 7. Copy output binary for GitHub Actions upload
           mkdir -p $GITHUB_WORKSPACE/build/app/outputs/flutter-apk
           cp build/app/outputs/flutter-apk/app-release.apk $GITHUB_WORKSPACE/build/app/outputs/flutter-apk/
 
