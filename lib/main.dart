@@ -8,6 +8,7 @@ import 'package:telephony/telephony.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 final Telephony telephony = Telephony.instance;
+final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
 // Background SMS Listener for incoming mesh packets
 @pragma('vm:entry-point')
@@ -17,6 +18,13 @@ void backgroundMessageHandler(SmsMessage message) async {
 
   if (body.startsWith("[TS_MESH]")) {
     final prefs = await SharedPreferences.getInstance();
+    final myPhone = prefs.getString('user_phone') ?? "";
+
+    // DROP duplicate loopback if message originated from current device
+    if (sender.isNotEmpty && myPhone.isNotEmpty && sender.contains(myPhone.replaceAll("+", ""))) {
+      return;
+    }
+
     List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
     final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
     
@@ -61,6 +69,7 @@ class TrailSafeApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: appNavigatorKey,
       title: 'TrailSafe',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
@@ -354,10 +363,16 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
       onNewMessage: (SmsMessage msg) async {
         final body = msg.body ?? "";
         final sender = msg.address ?? "Unknown";
+        final prefs = await SharedPreferences.getInstance();
+        final myPhone = prefs.getString('user_phone') ?? "";
+
+        // Drop incoming self-sent loopbacks
+        if (sender.isNotEmpty && myPhone.isNotEmpty && sender.contains(myPhone.replaceAll("+", ""))) {
+          return;
+        }
 
         if (body.startsWith("[TS_MESH]")) {
           final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
-          final prefs = await SharedPreferences.getInstance();
           List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
 
           if (cleanText.startsWith("EVENT_JOIN:")) {
@@ -370,7 +385,6 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
               'timestamp': DateTime.now().toIso8601String()
             }));
             
-            // Auto add to room members
             List<String> rawMems = prefs.getStringList('room_members') ?? [];
             bool exists = rawMems.any((m) => (jsonDecode(m)['phone'] as String) == sender);
             if (!exists) {
@@ -388,21 +402,90 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
           }
 
           await prefs.setStringList('mesh_chat_history', rawMsgs);
-          SystemSound.play(SystemSoundType.alert);
-          HapticFeedback.vibrate();
 
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                backgroundColor: const Color(0xFF132B1F),
-                content: Text("🚨 Signal from $sender: $cleanText", style: const TextStyle(color: Color(0xFF00E676))),
-              ),
-            );
+          // If payload is an Emergency SOS Alert, show high priority popup
+          if (cleanText.contains("SOS ALERT")) {
+            SystemSound.play(SystemSoundType.alert);
+            HapticFeedback.heavyImpact();
+            _showEmergencyPopup(sender, cleanText);
+          } else {
+            SystemSound.play(SystemSoundType.alert);
+            HapticFeedback.vibrate();
+
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  backgroundColor: const Color(0xFF132B1F),
+                  content: Text("🚨 Signal from $sender: $cleanText", style: const TextStyle(color: Color(0xFF00E676))),
+                ),
+              );
+            }
           }
         }
       },
       onBackgroundMessage: backgroundMessageHandler,
       listenInBackground: true,
+    );
+  }
+
+  void _showEmergencyPopup(String senderPhone, String alertText) {
+    final ctx = appNavigatorKey.currentContext ?? context;
+    showDialog(
+      context: ctx,
+      barrierDismissible: false,
+      builder: (dialogCtx) {
+        return Dialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          backgroundColor: Colors.white,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: const [
+                    Icon(Icons.warning_rounded, color: Color(0xFFDC2626), size: 30),
+                    SizedBox(width: 10),
+                    Text(
+                      "Emergency alert",
+                      style: TextStyle(
+                        color: Colors.black87,
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        fontFamily: 'sans-serif',
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  "Alert received from $senderPhone:\n\n$alertText\n\nImmediate assistance required.",
+                  style: const TextStyle(
+                    color: Colors.black87,
+                    fontSize: 14,
+                    height: 1.4,
+                    fontFamily: 'sans-serif',
+                  ),
+                ),
+                const SizedBox(height: 22),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFDC2626),
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    onPressed: () => Navigator.pop(dialogCtx),
+                    child: const Text("ACKNOWLEDGE", style: TextStyle(fontWeight: FontWeight.bold, fontFamily: 'sans-serif')),
+                  ),
+                )
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -446,9 +529,14 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
       return;
     }
 
+    final myPhone = prefs.getString('user_phone') ?? '';
+
+    // Broadcast SMS to all peer nodes EXCEPT current device
     for (var m in members) {
       final decoded = jsonDecode(m);
-      telephony.sendSms(to: decoded['phone'], message: payload);
+      if (decoded['phone'] != myPhone) {
+        telephony.sendSms(to: decoded['phone'], message: payload);
+      }
     }
 
     List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
@@ -465,7 +553,7 @@ class _SOSHomeScreenState extends State<SOSHomeScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: const Color(0xFFEF4444),
-          content: Text("⚡ SOS DISPATCHED TO ${members.length} REGISTERED MEMBERS", style: const TextStyle(fontWeight: FontWeight.bold)),
+          content: Text("⚡ SOS DISPATCHED TO REGISTERED MEMBERS", style: const TextStyle(fontWeight: FontWeight.bold)),
         ),
       );
     }
@@ -688,7 +776,7 @@ class _RoomHubScreenState extends State<RoomHubScreen> {
     rawMems.add(jsonEncode({'name': 'Host / Peer', 'phone': hostPhone}));
     await prefs.setStringList('room_members', rawMems);
 
-    // Broadcast Join Notification to the Host and registered peers via SMS
+    // Broadcast Join Notification to the Host via SMS
     telephony.sendSms(
       to: hostPhone,
       message: "[TS_MESH] EVENT_JOIN: $myName",
@@ -917,19 +1005,8 @@ class _MeshGroupChatScreenState extends State<MeshGroupChatScreen> {
 
     final prefs = await SharedPreferences.getInstance();
     final myName = prefs.getString('user_name') ?? 'Me';
-    List<String> rawMems = prefs.getStringList('room_members') ?? [];
 
-    if (rawMems.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Add room members in Room tab before transmitting!")));
-      return;
-    }
-
-    // Broadcast SMS to all nodes in room
-    for (var m in rawMems) {
-      final decoded = jsonDecode(m);
-      telephony.sendSms(to: decoded['phone'], message: "[TS_MESH] $myName: $text");
-    }
-
+    // Save only to local database / state (DO NOT SEND EXTERNAL SMS FOR REGULAR CHAT)
     List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
     rawMsgs.add(jsonEncode({
       'sender': myName,
