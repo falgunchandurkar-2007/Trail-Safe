@@ -2,16 +2,16 @@ name: Build TrailSafe APK
 
 on:
   push:
-    branches: [ main, master ]
-  workflow_dispatch:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -25,12 +25,8 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Generate Fresh Flutter Skeleton
-        run: flutter create --project-name=trailsafe --platforms=android .
-
-      - name: Add Required Dependencies
-        run: |
-          flutter pub add flutter_bloc equatable geolocator telephony shared_preferences
+      - name: Install Dependencies
+        run: flutter pub get
 
       - name: Build Release APK
         run: flutter build apk --release
