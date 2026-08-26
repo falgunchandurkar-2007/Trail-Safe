@@ -28,15 +28,15 @@ jobs:
 
       - name: Build TrailSafe Release APK
         run: |
-          # 1. Generate clean Flutter project base
+          # 1. Create pristine Flutter template
           flutter create --org com.trailsafe --project-name trailsafe /tmp/app
 
-          # 2. Copy application code and specifications
+          # 2. Copy source code & pubspec
           cp pubspec.yaml /tmp/app/pubspec.yaml
           rm -rf /tmp/app/lib
           cp -r lib /tmp/app/lib
 
-          # 3. Inject Android Manifest with all offline/mesh permissions
+          # 3. Inject Android Manifest with all permissions
           cat << 'EOF' > /tmp/app/android/app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
@@ -79,31 +79,11 @@ jobs:
           </manifest>
           EOF
 
-          # 4. Disable strict JVM target validation and enforce Java/Kotlin compatibility
-          mkdir -p ~/.gradle/init.d
-          cat << 'EOF' > ~/.gradle/gradle.properties
+          # 4. Configure gradle.properties to downgrade JVM target check to warning
+          cat << 'EOF' >> /tmp/app/android/gradle.properties
           kotlin.jvm.target.validation.mode=warning
-          org.gradle.jvmargs=-Xmx3072m
-          EOF
-
-          cat << 'EOF' > ~/.gradle/init.d/override-targets.gradle
-          allprojects {
-              tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
-                  kotlinOptions {
-                      jvmTarget = "1.8"
-                  }
-              }
-              afterEvaluate { project ->
-                  if (project.hasProperty('android')) {
-                      android {
-                          compileOptions {
-                              sourceCompatibility = JavaVersion.VERSION_1_8
-                              targetCompatibility = JavaVersion.VERSION_1_8
-                          }
-                      }
-                  }
-              }
-          }
+          android.useAndroidX=true
+          android.enableJetifier=true
           EOF
 
           # 5. Build Release APK
@@ -111,7 +91,7 @@ jobs:
           flutter pub get
           flutter build apk --release
 
-          # 6. Stage APK for download artifact
+          # 6. Export build artifact
           mkdir -p $GITHUB_WORKSPACE/build/app/outputs/flutter-apk
           cp build/app/outputs/flutter-apk/app-release.apk $GITHUB_WORKSPACE/build/app/outputs/flutter-apk/
 
