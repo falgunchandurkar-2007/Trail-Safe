@@ -1,136 +1,10 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:math';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:geolocator/geolocator.dart';
-import 'package:telephony/telephony.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'services/mesh_service.dart';
+import 'bloc/mesh_bloc.dart';
 
-final Telephony telephony = Telephony.instance;
-final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
-
-// Helper to sanitize phone numbers (removes country codes, spaces, +, etc.)
-String normalizePhone(String phone) {
-  String digits = phone.replaceAll(RegExp(r'\D'), '');
-  if (digits.length > 10) {
-    return digits.substring(digits.length - 10);
-  }
-  return digits;
-}
-
-// Global High-Priority Emergency Alert Modal
-void triggerGlobalEmergencyAlert(String senderInfo, String alertText) {
-  final context = appNavigatorKey.currentContext;
-  if (context != null) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogCtx) {
-        return Dialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          backgroundColor: Colors.white,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: const [
-                    Icon(Icons.warning_rounded, color: Color(0xFFDC2626), size: 30),
-                    SizedBox(width: 10),
-                    Text(
-                      "Emergency alert",
-                      style: TextStyle(
-                        color: Colors.black87,
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
-                        fontFamily: 'sans-serif',
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 14),
-                Text(
-                  "Alert received from $senderInfo:\n\n$alertText\n\nImmediate assistance required.",
-                  style: const TextStyle(
-                    color: Colors.black87,
-                    fontSize: 14,
-                    height: 1.4,
-                    fontFamily: 'sans-serif',
-                  ),
-                ),
-                const SizedBox(height: 22),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFFDC2626),
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                    ),
-                    onPressed: () => Navigator.pop(dialogCtx),
-                    child: const Text("ACKNOWLEDGE", style: TextStyle(fontWeight: FontWeight.bold, fontFamily: 'sans-serif')),
-                  ),
-                )
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-}
-
-// Background SMS Listener
-@pragma('vm:entry-point')
-void backgroundMessageHandler(SmsMessage message) async {
-  final body = message.body ?? "";
-  final sender = message.address ?? "Unknown";
-
-  if (body.startsWith("[TS_MESH]")) {
-    final prefs = await SharedPreferences.getInstance();
-    final myPhone = prefs.getString('user_phone') ?? "";
-
-    // Ignore self-sent loopback messages
-    if (normalizePhone(sender) == normalizePhone(myPhone) && myPhone.isNotEmpty) {
-      return;
-    }
-
-    List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
-    final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
-
-    if (cleanText.startsWith("EVENT_JOIN:")) {
-      final joinedName = cleanText.replaceFirst("EVENT_JOIN:", "").trim();
-      rawMsgs.add(jsonEncode({
-        'sender': 'SYSTEM',
-        'text': '⚡ $joinedName has entered the secure room.',
-        'isMe': false,
-        'isSystem': true,
-        'timestamp': DateTime.now().toIso8601String()
-      }));
-
-      List<String> rawMems = prefs.getStringList('room_members') ?? [];
-      bool exists = rawMems.any((m) => normalizePhone(jsonDecode(m)['phone'] ?? '') == normalizePhone(sender));
-      if (!exists) {
-        rawMems.add(jsonEncode({'name': joinedName, 'phone': sender}));
-        await prefs.setStringList('room_members', rawMems);
-      }
-    } else {
-      rawMsgs.add(jsonEncode({
-        'sender': sender,
-        'text': cleanText,
-        'isMe': false,
-        'isSystem': false,
-        'timestamp': DateTime.now().toIso8601String()
-      }));
-    }
-    await prefs.setStringList('mesh_chat_history', rawMsgs);
-  }
-}
-
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const TrailSafeApp());
 }
@@ -141,1155 +15,191 @@ class TrailSafeApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      navigatorKey: appNavigatorKey,
-      title: 'TrailSafe',
+      title: 'TrailSafe Mesh',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF09140E),
-        primaryColor: const Color(0xFF00E676),
-        fontFamily: 'monospace',
+      theme: ThemeData.dark().copyWith(
+        scaffoldBackgroundColor: const Color(0xFF0D1117),
+        colorScheme: const ColorScheme.dark(
+          primary: Color(0xFF238636),
+          error: Color(0xFFDA3633),
+        ),
       ),
-      home: const AuthGateScreen(),
+      home: const MeshChatScreen(),
     );
   }
 }
 
-// ---------------- AUTH CHECK / GATE ----------------
-class AuthGateScreen extends StatefulWidget {
-  const AuthGateScreen({super.key});
+class MeshChatScreen extends StatefulWidget {
+  const MeshChatScreen({super.key});
+
   @override
-  State<AuthGateScreen> createState() => _AuthGateScreenState();
+  State<MeshChatScreen> createState() => _MeshChatScreenState();
 }
 
-class _AuthGateScreenState extends State<AuthGateScreen> {
+class _MeshChatScreenState extends State<MeshChatScreen> {
+  final TextEditingController _msgController = TextEditingController();
+  final String _username = "Hiker_${DateTime.now().millisecond}";
+  late MeshService _meshService;
+  late MeshBloc _meshBloc;
+
   @override
   void initState() {
     super.initState();
-    _checkSession();
+    _meshService = MeshService();
+    _meshBloc = MeshBloc(_meshService);
+    _initPermissions();
   }
 
-  void _checkSession() async {
-    final prefs = await SharedPreferences.getInstance();
-    final phone = prefs.getString('user_phone');
-    if (!mounted) return;
-    if (phone != null && phone.isNotEmpty) {
-      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainNavigationScreen()));
-    } else {
-      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginRegistrationScreen()));
-    }
-  }
+  Future<void> _initPermissions() async {
+    await [
+      Permission.location,
+      Permission.bluetooth,
+      Permission.bluetoothScan,
+      Permission.bluetoothAdvertise,
+      Permission.bluetoothConnect,
+      Permission.nearbyWifiDevices,
+    ].request();
 
-  @override
-  Widget build(BuildContext context) {
-    return const Scaffold(
-      backgroundColor: Color(0xFF09140E),
-      body: Center(child: CircularProgressIndicator(color: Color(0xFF00E676))),
-    );
-  }
-}
-
-// ---------------- LOGIN SCREEN ----------------
-class LoginRegistrationScreen extends StatefulWidget {
-  const LoginRegistrationScreen({super.key});
-  @override
-  State<LoginRegistrationScreen> createState() => _LoginRegistrationScreenState();
-}
-
-class _LoginRegistrationScreenState extends State<LoginRegistrationScreen> {
-  final _nameCtrl = TextEditingController();
-  final _phoneCtrl = TextEditingController();
-  final _otpCtrl = TextEditingController();
-  String? generatedOTP;
-  bool isOtpSent = false;
-
-  void _sendOTP() async {
-    if (_nameCtrl.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Please enter your full name")));
-      return;
-    }
-    if (_phoneCtrl.text.trim().length < 10) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Please enter a valid 10-digit mobile number")));
-      return;
-    }
-
-    SystemSound.play(SystemSoundType.click);
-    HapticFeedback.mediumImpact();
-
-    final otp = (1000 + Random().nextInt(9000)).toString();
-    setState(() {
-      generatedOTP = otp;
-      isOtpSent = true;
-    });
-
-    telephony.sendSms(
-      to: _phoneCtrl.text.trim(),
-      message: "[TrailSafe] Welcome ${_nameCtrl.text.trim()}! Your authentication OTP is: $otp",
-    );
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        backgroundColor: const Color(0xFF132B1F),
-        content: Text("⚡ OTP Sent to ${_phoneCtrl.text}: $otp", style: const TextStyle(color: Color(0xFF00E676))),
-      ),
-    );
-  }
-
-  void _verifyAndRegister() async {
-    if (_otpCtrl.text.trim() == generatedOTP) {
-      SystemSound.play(SystemSoundType.click);
-      HapticFeedback.heavyImpact();
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('user_name', _nameCtrl.text.trim());
-      await prefs.setString('user_phone', _phoneCtrl.text.trim());
-      if (mounted) {
-        Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainNavigationScreen()));
-      }
-    } else {
-      HapticFeedback.vibrate();
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Invalid OTP code. Please retry.")));
-    }
+    _meshBloc.add(StartMeshEvent(_username));
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 24),
-        child: Center(
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(color: const Color(0xFF00E676), width: 2),
-                    boxShadow: [BoxShadow(color: const Color(0xFF00E676).withOpacity(0.2), blurRadius: 20)],
-                  ),
-                  child: const Icon(Icons.shield_outlined, size: 50, color: Color(0xFF00E676)),
-                ),
-                const SizedBox(height: 18),
-                const Text("TRAILSAFE TERMINAL", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, letterSpacing: 2, color: Colors.white)),
-                const Text("IDENTITY VERIFICATION GATEWAY", style: TextStyle(fontSize: 10, color: Color(0xFF00E676), letterSpacing: 1.5)),
-                const SizedBox(height: 30),
-                TextField(
-                  controller: _nameCtrl,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    prefixIcon: const Icon(Icons.person_outline, color: Color(0xFF00E676)),
-                    hintText: "Full Name (Trekker Identity)",
-                    hintStyle: TextStyle(color: Colors.white.withOpacity(0.3)),
-                    filled: true,
-                    fillColor: const Color(0xFF132B1F),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _phoneCtrl,
-                  keyboardType: TextInputType.phone,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    prefixIcon: const Icon(Icons.phone_android, color: Color(0xFF00E676)),
-                    hintText: "Mobile Number (+91...)",
-                    hintStyle: TextStyle(color: Colors.white.withOpacity(0.3)),
-                    filled: true,
-                    fillColor: const Color(0xFF132B1F),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-                  ),
-                ),
-                if (isOtpSent) ...[
-                  const SizedBox(height: 14),
-                  TextField(
-                    controller: _otpCtrl,
-                    keyboardType: TextInputType.number,
-                    style: const TextStyle(color: Colors.white, letterSpacing: 8, fontSize: 18),
-                    textAlign: TextAlign.center,
-                    decoration: InputDecoration(
-                      hintText: "4-DIGIT OTP",
-                      hintStyle: TextStyle(color: Colors.white.withOpacity(0.3), letterSpacing: 1),
-                      filled: true,
-                      fillColor: const Color(0xFF132B1F),
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-                    ),
-                  ),
-                ],
-                const SizedBox(height: 22),
-                SizedBox(
-                  width: double.infinity,
-                  height: 52,
-                  child: ElevatedButton(
-                    onPressed: isOtpSent ? _verifyAndRegister : _sendOTP,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF00E676),
-                      foregroundColor: Colors.black,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    ),
-                    child: Text(
-                      isOtpSent ? "VERIFY & INITIALIZE" : "SEND SMS OTP CODE",
-                      style: const TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2),
-                    ),
-                  ),
-                )
-              ],
-            ),
+    return BlocProvider(
+      create: (_) => _meshBloc,
+      child: Scaffold(
+        appBar: AppBar(
+          backgroundColor: const Color(0xFF161B22),
+          title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('SHARED OFFLINE MESH CHAT', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+              BlocBuilder<MeshBloc, MeshState>(
+                builder: (context, state) {
+                  int peers = (state is MeshLoadedState) ? state.peerCount : 0;
+                  return Text(
+                    'ACTIVE MEMBERS: $peers',
+                    style: TextStyle(fontSize: 11, color: peers > 0 ? Colors.greenAccent : Colors.grey),
+                  );
+                },
+              ),
+            ],
           ),
-        ),
-      ),
-    );
-  }
-}
-
-// ---------------- MAIN NAVIGATION SCREEN ----------------
-class MainNavigationScreen extends StatefulWidget {
-  const MainNavigationScreen({super.key});
-  @override
-  State<MainNavigationScreen> createState() => _MainNavigationScreenState();
-}
-
-class _MainNavigationScreenState extends State<MainNavigationScreen> {
-  int _currentIndex = 0;
-  final List<Widget> _screens = [
-    const SOSHomeScreen(),
-    const RoomHubScreen(),
-    const MeshGroupChatScreen(),
-    const HospitalRadarScreen(),
-    const UserProfileDetailsScreen(),
-  ];
-
-  @override
-  void initState() {
-    super.initState();
-    _startGlobalSmsListener();
-  }
-
-  void _startGlobalSmsListener() async {
-    await telephony.requestPhoneAndSmsPermissions;
-    telephony.listenIncomingSms(
-      onNewMessage: (SmsMessage msg) async {
-        final body = msg.body ?? "";
-        final sender = msg.address ?? "Unknown";
-        final prefs = await SharedPreferences.getInstance();
-        final myPhone = prefs.getString('user_phone') ?? "";
-
-        // Prevent self loopback duplication
-        if (normalizePhone(sender) == normalizePhone(myPhone) && myPhone.isNotEmpty) {
-          return;
-        }
-
-        if (body.startsWith("[TS_MESH]")) {
-          final cleanText = body.replaceFirst("[TS_MESH]", "").trim();
-          List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
-
-          if (cleanText.startsWith("EVENT_JOIN:")) {
-            final joinedName = cleanText.replaceFirst("EVENT_JOIN:", "").trim();
-            rawMsgs.add(jsonEncode({
-              'sender': 'SYSTEM',
-              'text': '⚡ $joinedName has entered the room.',
-              'isMe': false,
-              'isSystem': true,
-              'timestamp': DateTime.now().toIso8601String()
-            }));
-
-            List<String> rawMems = prefs.getStringList('room_members') ?? [];
-            bool exists = rawMems.any((m) => normalizePhone(jsonDecode(m)['phone'] ?? '') == normalizePhone(sender));
-            if (!exists) {
-              rawMems.add(jsonEncode({'name': joinedName, 'phone': sender}));
-              await prefs.setStringList('room_members', rawMems);
-            }
-          } else {
-            rawMsgs.add(jsonEncode({
-              'sender': sender,
-              'text': cleanText,
-              'isMe': false,
-              'isSystem': false,
-              'timestamp': DateTime.now().toIso8601String()
-            }));
-          }
-
-          await prefs.setStringList('mesh_chat_history', rawMsgs);
-
-          // Check for SOS Alert and trigger modal immediately
-          if (cleanText.contains("SOS ALERT")) {
-            SystemSound.play(SystemSoundType.alert);
-            HapticFeedback.heavyImpact();
-            triggerGlobalEmergencyAlert(sender, cleanText);
-          } else {
-            SystemSound.play(SystemSoundType.alert);
-            HapticFeedback.vibrate();
-          }
-        }
-      },
-      onBackgroundMessage: backgroundMessageHandler,
-      listenInBackground: true,
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: _screens[_currentIndex],
-      bottomNavigationBar: BottomNavigationBar(
-        currentIndex: _currentIndex,
-        onTap: (index) {
-          SystemSound.play(SystemSoundType.click);
-          setState(() => _currentIndex = index);
-        },
-        type: BottomNavigationBarType.fixed,
-        backgroundColor: const Color(0xFF060E0A),
-        selectedItemColor: const Color(0xFF00E676),
-        unselectedItemColor: const Color(0xFF4A6B59),
-        items: const [
-          BottomNavigationBarItem(icon: Icon(Icons.error_outline), label: 'SOS'),
-          BottomNavigationBarItem(icon: Icon(Icons.meeting_room_outlined), label: 'Room'),
-          BottomNavigationBarItem(icon: Icon(Icons.forum_outlined), label: 'Mesh Chat'),
-          BottomNavigationBarItem(icon: Icon(Icons.local_hospital_outlined), label: 'Hospitals'),
-          BottomNavigationBarItem(icon: Icon(Icons.person_outline), label: 'Profile'),
-        ],
-      ),
-    );
-  }
-}
-
-// ---------------- 1. SOS HOME SCREEN ----------------
-class SOSHomeScreen extends StatefulWidget {
-  const SOSHomeScreen({super.key});
-  @override
-  State<SOSHomeScreen> createState() => _SOSHomeScreenState();
-}
-
-class _SOSHomeScreenState extends State<SOSHomeScreen> {
-  String _selectedEmergency = "Injury";
-  String _gpsText = "Tap refresh to get GPS coordinates";
-  bool _fetchingGps = false;
-  Position? _currentPosition;
-  String _activeRoomCode = "NO ACTIVE ROOM";
-
-  final List<Map<String, dynamic>> emergencies = [
-    {"label": "Injury", "icon": Icons.healing},
-    {"label": "Snake Bite", "icon": Icons.pest_control_rounded},
-    {"label": "Lost", "icon": Icons.help_outline},
-    {"label": "Bad Weather", "icon": Icons.thunderstorm_outlined},
-    {"label": "Medical", "icon": Icons.medical_services_outlined},
-    {"label": "General SOS", "icon": Icons.warning_amber_rounded},
-  ];
-
-  @override
-  void initState() {
-    super.initState();
-    _getGPS();
-    _loadRoomStatus();
-  }
-
-  void _loadRoomStatus() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _activeRoomCode = prefs.getString('current_room_code') ?? "NO ACTIVE ROOM";
-    });
-  }
-
-  void _getGPS() async {
-    setState(() => _fetchingGps = true);
-    try {
-      LocationPermission perm = await Geolocator.checkPermission();
-      if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
-      Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
-      setState(() {
-        _currentPosition = pos;
-        _gpsText = "LAT: ${pos.latitude.toStringAsFixed(5)} | LON: ${pos.longitude.toStringAsFixed(5)}";
-        _fetchingGps = false;
-      });
-    } catch (e) {
-      setState(() {
-        _gpsText = "Satellites Connected (Offline Mode)";
-        _fetchingGps = false;
-      });
-    }
-  }
-
-  void _triggerEmergencySOS() async {
-    SystemSound.play(SystemSoundType.alert);
-    HapticFeedback.heavyImpact();
-
-    final prefs = await SharedPreferences.getInstance();
-    final myName = prefs.getString('user_name') ?? 'Trekker';
-    final myPhone = prefs.getString('user_phone') ?? '';
-    List<String> members = prefs.getStringList('room_members') ?? [];
-
-    String coords = _currentPosition != null
-        ? "https://maps.google.com/?q=${_currentPosition!.latitude},${_currentPosition!.longitude}"
-        : "GPS Satellite Fix";
-
-    String payload = "[TS_MESH] 🚨 SOS ALERT from $myName: $_selectedEmergency! Location: $coords";
-
-    if (members.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("No room members found! Host or Join a room in Room tab.")),
-      );
-      return;
-    }
-
-    // Send SOS ONLY to peer devices (Skips self phone number)
-    for (var m in members) {
-      final decoded = jsonDecode(m);
-      final memberPhone = decoded['phone']?.toString() ?? '';
-      if (normalizePhone(memberPhone) != normalizePhone(myPhone) && memberPhone.isNotEmpty) {
-        telephony.sendSms(to: memberPhone, message: payload);
-      }
-    }
-
-    // Append to local chat only once
-    List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
-    rawMsgs.add(jsonEncode({
-      'sender': 'ME (SOS)',
-      'text': "🚨 EMERGENCY DISPATCH: $_selectedEmergency ($coords)",
-      'isMe': true,
-      'isSystem': false,
-      'timestamp': DateTime.now().toIso8601String()
-    }));
-    await prefs.setStringList('mesh_chat_history', rawMsgs);
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          backgroundColor: Color(0xFFEF4444),
-          content: Text("⚡ SOS DISPATCHED TO REGISTERED PEER NODES", style: TextStyle(fontWeight: FontWeight.bold)),
-        ),
-      );
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text("TrailSafe", style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: Colors.white)),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF132B1F),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: const Color(0xFF00E676)),
-                  ),
-                  child: Text("ROOM: $_activeRoomCode", style: const TextStyle(fontSize: 10, color: Color(0xFF00E676), fontWeight: FontWeight.bold)),
-                ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-              decoration: BoxDecoration(
-                color: const Color(0xFF10241A),
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: const Color(0xFF1F4330)),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.location_on, color: Color(0xFF00E676), size: 18),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text("GPS LOCATION", style: TextStyle(fontSize: 10, color: Color(0xFF4ADE80), letterSpacing: 1.2, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 2),
-                        Text(_gpsText, style: TextStyle(fontSize: 12, color: Colors.white.withOpacity(0.8))),
-                      ],
-                    ),
-                  ),
-                  IconButton(
-                    icon: _fetchingGps
-                        ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00E676)))
-                        : const Icon(Icons.refresh, color: Color(0xFF4ADE80)),
-                    onPressed: _getGPS,
-                  )
-                ],
-              ),
-            ),
-            const Spacer(),
-            Center(
-              child: GestureDetector(
-                onTap: _triggerEmergencySOS,
-                child: Container(
-                  width: 210,
-                  height: 210,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(color: const Color(0xFF7F1D1D), width: 3),
-                    boxShadow: [
-                      BoxShadow(color: const Color(0xFFEF4444).withOpacity(0.35), blurRadius: 35, spreadRadius: 4),
-                    ],
-                  ),
-                  child: Center(
-                    child: Container(
-                      width: 165,
-                      height: 165,
-                      decoration: const BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: Color(0xFFEF4444),
-                      ),
-                      child: const Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Text("SOS", style: TextStyle(fontSize: 40, fontWeight: FontWeight.w900, letterSpacing: 2, color: Colors.white)),
-                          Text("Press to alert", style: TextStyle(fontSize: 11, color: Colors.white70)),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            const Spacer(),
-            const Text("SELECT EMERGENCY TYPE", style: TextStyle(fontSize: 11, color: Color(0xFF4ADE80), letterSpacing: 1.5, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: emergencies.map((item) {
-                final isSelected = _selectedEmergency == item['label'];
-                return GestureDetector(
-                  onTap: () {
-                    SystemSound.play(SystemSoundType.click);
-                    setState(() => _selectedEmergency = item['label']);
-                  },
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: isSelected ? const Color(0xFFDC2626) : const Color(0xFF132B1F),
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: isSelected ? const Color(0xFFEF4444) : const Color(0xFF1F4330)),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(item['icon'], size: 16, color: isSelected ? Colors.white : const Color(0xFF4ADE80)),
-                        const SizedBox(width: 6),
-                        Text(item['label'], style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isSelected ? Colors.white : Colors.white70)),
-                      ],
-                    ),
-                  ),
-                );
-              }).toList(),
-            ),
-            const SizedBox(height: 14),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-              decoration: BoxDecoration(
-                color: const Color(0xFF10241A),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFF1F4330)),
-              ),
-              child: const Row(
-                children: [
-                  Icon(Icons.group, color: Color(0xFF4ADE80), size: 20),
-                  SizedBox(width: 10),
-                  Expanded(
-                    child: Text("Offline mesh linked. Manage room nodes in Room tab.", style: TextStyle(fontSize: 11, color: Colors.white70)),
-                  )
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ---------------- 2. ROOM HUB SCREEN ----------------
-class RoomHubScreen extends StatefulWidget {
-  const RoomHubScreen({super.key});
-  @override
-  State<RoomHubScreen> createState() => _RoomHubScreenState();
-}
-
-class _RoomHubScreenState extends State<RoomHubScreen> {
-  final _roomCodeCtrl = TextEditingController();
-  final _hostPhoneCtrl = TextEditingController();
-  String _currentRoom = "None";
-  List<Map<String, dynamic>> _roomMembers = [];
-
-  @override
-  void initState() {
-    super.initState();
-    _loadRoomData();
-  }
-
-  void _loadRoomData() async {
-    final prefs = await SharedPreferences.getInstance();
-    List<String> rawMems = prefs.getStringList('room_members') ?? [];
-    setState(() {
-      _currentRoom = prefs.getString('current_room_code') ?? "None";
-      _roomMembers = rawMems.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
-    });
-  }
-
-  void _hostNewRoom() async {
-    final code = "TRK-${1000 + Random().nextInt(9000)}";
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('current_room_code', code);
-
-    final myName = prefs.getString('user_name') ?? 'Host';
-    final myPhone = prefs.getString('user_phone') ?? '';
-    List<String> mems = [jsonEncode({'name': myName, 'phone': myPhone, 'role': 'HOST'})];
-    await prefs.setStringList('room_members', mems);
-
-    _loadRoomData();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(backgroundColor: const Color(0xFF132B1F), content: Text("⚡ Hosted Room: $code", style: const TextStyle(color: Color(0xFF00E676)))),
-    );
-  }
-
-  void _joinRoomByHostPhone() async {
-    final hostPhone = _hostPhoneCtrl.text.trim();
-    final roomCode = _roomCodeCtrl.text.trim();
-    if (hostPhone.length < 10 || roomCode.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Enter valid Room Code and Host Mobile Number")));
-      return;
-    }
-
-    final prefs = await SharedPreferences.getInstance();
-    final myName = prefs.getString('user_name') ?? 'Trekker';
-    await prefs.setString('current_room_code', roomCode);
-
-    List<String> rawMems = prefs.getStringList('room_members') ?? [];
-    bool exists = rawMems.any((m) => normalizePhone(jsonDecode(m)['phone'] ?? '') == normalizePhone(hostPhone));
-    if (!exists) {
-      rawMems.add(jsonEncode({'name': 'Host / Peer', 'phone': hostPhone}));
-      await prefs.setStringList('room_members', rawMems);
-    }
-
-    // Broadcast join via SMS to host
-    telephony.sendSms(
-      to: hostPhone,
-      message: "[TS_MESH] EVENT_JOIN: $myName",
-    );
-
-    List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
-    rawMsgs.add(jsonEncode({
-      'sender': 'SYSTEM',
-      'text': '⚡ You joined Room $roomCode. Sent join broadcast to $hostPhone.',
-      'isMe': true,
-      'isSystem': true,
-      'timestamp': DateTime.now().toIso8601String()
-    }));
-    await prefs.setStringList('mesh_chat_history', rawMsgs);
-
-    _loadRoomData();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(backgroundColor: const Color(0xFF132B1F), content: Text("Joined Room $roomCode! Notification broadcasted to $hostPhone.", style: const TextStyle(color: Color(0xFF00E676)))),
-    );
-  }
-
-  void _addManualMember() {
-    final nameCtrl = TextEditingController();
-    final phoneCtrl = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: const Color(0xFF10241A),
-        title: const Text("ADD ROOM MEMBER (NODE)", style: TextStyle(color: Color(0xFF00E676), fontSize: 13)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(controller: nameCtrl, style: const TextStyle(color: Colors.white), decoration: const InputDecoration(hintText: "Member Name")),
-            TextField(controller: phoneCtrl, keyboardType: TextInputType.phone, style: const TextStyle(color: Colors.white), decoration: const InputDecoration(hintText: "Phone (+91...)")),
-          ],
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CANCEL", style: TextStyle(color: Colors.white54))),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00E676), foregroundColor: Colors.black),
-            onPressed: () async {
-              if (phoneCtrl.text.isNotEmpty) {
-                final prefs = await SharedPreferences.getInstance();
-                List<String> mems = prefs.getStringList('room_members') ?? [];
-                mems.add(jsonEncode({'name': nameCtrl.text.trim(), 'phone': phoneCtrl.text.trim()}));
-                await prefs.setStringList('room_members', mems);
-                _loadRoomData();
-                Navigator.pop(context);
-              }
-            },
-            child: const Text("ADD TO ROOM"),
-          )
-        ],
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text("ROOM LOBBY & NODES", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
-            const SizedBox(height: 12),
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: const Color(0xFF10241A),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFF00E676)),
-              ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text("ACTIVE MESH ROOM", style: TextStyle(fontSize: 10, color: Color(0xFF4ADE80), fontWeight: FontWeight.bold)),
-                      const SizedBox(height: 4),
-                      Text(_currentRoom, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
-                    ],
-                  ),
-                  ElevatedButton(
-                    onPressed: _hostNewRoom,
-                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00E676), foregroundColor: Colors.black),
-                    child: const Text("HOST NEW ROOM", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                  )
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: const Color(0xFF132B1F),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFF1F4330)),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text("JOIN EXISTING ROOM", style: TextStyle(fontSize: 11, color: Color(0xFF00E676), fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: _roomCodeCtrl,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: const InputDecoration(hintText: "Enter Room Code (e.g. TRK-4821)", isDense: true),
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: _hostPhoneCtrl,
-                    keyboardType: TextInputType.phone,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: const InputDecoration(hintText: "Enter Host/Peer Phone (+91...)", isDense: true),
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton(
-                      onPressed: _joinRoomByHostPhone,
-                      style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E4D34), foregroundColor: const Color(0xFF00E676)),
-                      child: const Text("JOIN & BROADCAST NOTIFICATION"),
-                    ),
-                  )
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text("ROOM MEMBERS (${_roomMembers.length})", style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF4ADE80))),
-                IconButton(icon: const Icon(Icons.person_add, color: Color(0xFF00E676)), onPressed: _addManualMember),
-              ],
-            ),
-            Expanded(
-              child: _roomMembers.isEmpty
-                  ? const Center(child: Text("No registered members yet. Host, join, or add nodes above.", style: TextStyle(color: Colors.white38, fontSize: 11)))
-                  : ListView.builder(
-                      itemCount: _roomMembers.length,
-                      itemBuilder: (_, i) {
-                        final m = _roomMembers[i];
-                        return Container(
-                          margin: const EdgeInsets.symmetric(vertical: 4),
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF10241A),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(color: const Color(0xFF1F4330)),
-                          ),
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(m['name'] ?? 'Unknown', style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
-                                  Text(m['phone'] ?? '', style: const TextStyle(fontSize: 11, color: Color(0xFF4ADE80))),
-                                ],
-                              ),
-                              const Icon(Icons.check_circle, color: Color(0xFF00E676), size: 18),
-                            ],
-                          ),
-                        );
-                      },
-                    ),
+          actions: const [
+            Padding(
+              padding: EdgeInsets.only(right: 16.0),
+              child: Icon(Icons.wifi_tethering, color: Colors.greenAccent),
             )
           ],
         ),
-      ),
-    );
-  }
-}
-
-// ---------------- 3. OFFLINE MESH GROUP CHAT SCREEN ----------------
-class MeshGroupChatScreen extends StatefulWidget {
-  const MeshGroupChatScreen({super.key});
-  @override
-  State<MeshGroupChatScreen> createState() => _MeshGroupChatScreenState();
-}
-
-class _MeshGroupChatScreenState extends State<MeshGroupChatScreen> {
-  final _msgCtrl = TextEditingController();
-  List<Map<String, dynamic>> _messages = [];
-  List<Map<String, dynamic>> _members = [];
-  String _myPhone = "";
-
-  @override
-  void initState() {
-    super.initState();
-    _refreshChat();
-    Timer.periodic(const Duration(milliseconds: 1500), (_) => _refreshChat());
-  }
-
-  void _refreshChat() async {
-    final prefs = await SharedPreferences.getInstance();
-    List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
-    List<String> rawMems = prefs.getStringList('room_members') ?? [];
-    final phone = prefs.getString('user_phone') ?? "";
-
-    if (mounted) {
-      setState(() {
-        _myPhone = phone;
-        _messages = rawMsgs.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
-        _members = rawMems.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
-      });
-    }
-  }
-
-  void _sendGroupMessage() async {
-    final text = _msgCtrl.text.trim();
-    if (text.isEmpty) return;
-    _msgCtrl.clear();
-
-    SystemSound.play(SystemSoundType.click);
-    HapticFeedback.lightImpact();
-
-    final prefs = await SharedPreferences.getInstance();
-    final myName = prefs.getString('user_name') ?? 'Me';
-    List<String> rawMems = prefs.getStringList('room_members') ?? [];
-
-    // Broadcast SMS ONLY to peer devices (Skips self phone number)
-    for (var m in rawMems) {
-      final decoded = jsonDecode(m);
-      final memberPhone = decoded['phone']?.toString() ?? '';
-      if (normalizePhone(memberPhone) != normalizePhone(_myPhone) && memberPhone.isNotEmpty) {
-        telephony.sendSms(to: memberPhone, message: "[TS_MESH] $myName: $text");
-      }
-    }
-
-    // Save only 1 copy to local chat history for the sender
-    List<String> rawMsgs = prefs.getStringList('mesh_chat_history') ?? [];
-    rawMsgs.add(jsonEncode({
-      'sender': myName,
-      'text': text,
-      'isMe': true,
-      'isSystem': false,
-      'timestamp': DateTime.now().toIso8601String()
-    }));
-    await prefs.setStringList('mesh_chat_history', rawMsgs);
-
-    _refreshChat();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Column(
-        children: [
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            color: const Color(0xFF10241A),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text("SHARED OFFLINE MESH CHAT", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
-                    Text("ACTIVE MEMBERS: ${_members.length}", style: const TextStyle(fontSize: 10, color: Color(0xFF00E676))),
-                  ],
+        body: Column(
+          children: [
+            // Panic SOS Header Action
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              color: const Color(0xFF161B22),
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFDA3633),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                 ),
-                const Icon(Icons.wifi_tethering, color: Color(0xFF00E676), size: 20),
-              ],
+                icon: const Icon(Icons.emergency_share, color: Colors.white),
+                label: const Text('DISPATCH PANIC SOS TO ALL NODES', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+                onPressed: () => _meshBloc.add(PanicSosEvent(_username)),
+              ),
             ),
-          ),
-          Expanded(
-            child: _messages.isEmpty
-                ? const Center(child: Text("No messages yet. Send an offline text to all room members!", style: TextStyle(color: Colors.white38, fontSize: 11)))
-                : ListView.builder(
-                    padding: const EdgeInsets.all(12),
-                    itemCount: _messages.length,
-                    itemBuilder: (_, i) {
-                      final m = _messages[i];
-                      final isMe = m['isMe'] == true;
-                      final isSystem = m['isSystem'] == true;
 
-                      if (isSystem) {
-                        return Center(
-                          child: Container(
-                            margin: const EdgeInsets.symmetric(vertical: 6),
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF132B1F),
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: const Color(0xFF00E676).withOpacity(0.3)),
-                            ),
-                            child: Text(m['text'] ?? '', style: const TextStyle(fontSize: 10, color: Color(0xFF00E676))),
-                          ),
-                        );
-                      }
+            // Tactical Messages Stream
+            Expanded(
+              child: BlocBuilder<MeshBloc, MeshState>(
+                builder: (context, state) {
+                  if (state is! MeshLoadedState) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
+
+                  return ListView.builder(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: state.messages.length,
+                    itemBuilder: (context, index) {
+                      final item = state.messages[index];
+                      final isSos = item['isSos'] == 1;
+                      final isMe = item['sender'] == 'ME';
 
                       return Align(
                         alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
                         child: Container(
-                          margin: const EdgeInsets.symmetric(vertical: 4),
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          margin: const EdgeInsets.symmetric(vertical: 5),
+                          padding: const EdgeInsets.all(10),
+                          constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.85),
                           decoration: BoxDecoration(
-                            color: isMe ? const Color(0xFF1E4D34) : const Color(0xFF132B1F),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(color: isMe ? const Color(0xFF00E676) : const Color(0xFF2A5940)),
+                            color: isSos
+                                ? const Color(0xFF7F1D1D)
+                                : (isMe ? const Color(0xFF238636) : const Color(0xFF21262D)),
+                            border: Border.all(
+                              color: isSos ? Colors.redAccent : Colors.green.withOpacity(0.3),
+                              width: 1.2,
+                            ),
+                            borderRadius: BorderRadius.circular(8),
                           ),
                           child: Column(
-                            crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Text(m['sender'] ?? '', style: TextStyle(fontSize: 9, color: isMe ? const Color(0xFF4ADE80) : Colors.amber, fontWeight: FontWeight.bold)),
-                              const SizedBox(height: 2),
-                              Text(m['text'] ?? '', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                              Text(
+                                '${item['sender']} ${isSos ? "(SOS)" : ""}',
+                                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.white70),
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                item['content'] ?? '',
+                                style: const TextStyle(fontSize: 13, color: Colors.white),
+                              ),
                             ],
                           ),
                         ),
                       );
                     },
-                  ),
-          ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            color: const Color(0xFF060E0A),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _msgCtrl,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: InputDecoration(
-                      hintText: "Broadcast over offline mesh...",
-                      hintStyle: TextStyle(color: Colors.white.withOpacity(0.3)),
-                      filled: true,
-                      fillColor: const Color(0xFF10241A),
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(24), borderSide: BorderSide.none),
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                IconButton(
-                  icon: const Icon(Icons.send_rounded, color: Color(0xFF00E676)),
-                  onPressed: _sendGroupMessage,
-                )
-              ],
-            ),
-          )
-        ],
-      ),
-    );
-  }
-}
-
-// ---------------- 4. HOSPITALS RADAR SCREEN ----------------
-class HospitalRadarScreen extends StatelessWidget {
-  const HospitalRadarScreen({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    final List<Map<String, String>> mockHospitals = [
-      {"name": "District Emergency Trauma Centre", "dist": "3.4 km", "contact": "108"},
-      {"name": "Wilderness Rescue First Post", "dist": "6.1 km", "contact": "112"},
-      {"name": "Valley Base Medical Station", "dist": "11.8 km", "contact": "+91 9876543210"},
-    ];
-
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text("OFFLINE MEDICAL RADAR", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
-            const Text("PRE-CACHED EMERGENCY DISPATCH POSTS", style: TextStyle(fontSize: 10, color: Color(0xFF00E676), letterSpacing: 1.2)),
-            const SizedBox(height: 16),
-            Expanded(
-              child: ListView.builder(
-                itemCount: mockHospitals.length,
-                itemBuilder: (_, i) {
-                  final h = mockHospitals[i];
-                  return Container(
-                    margin: const EdgeInsets.symmetric(vertical: 6),
-                    padding: const EdgeInsets.all(14),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF10241A),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: const Color(0xFF1F4330)),
-                    ),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(h['name']!, style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 13)),
-                            const SizedBox(height: 2),
-                            Text("Triangulated Distance: ${h['dist']}", style: const TextStyle(fontSize: 11, color: Color(0xFF4ADE80))),
-                          ],
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.call, color: Color(0xFF00E676)),
-                          onPressed: () {
-                            telephony.sendSms(to: h['contact']!, message: "[TS_MESH] REQUESTING MEDICAL EVACUATION");
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Alerted ${h['name']} via direct SMS")));
-                          },
-                        )
-                      ],
-                    ),
                   );
                 },
+              ),
+            ),
+
+            // Input Bar
+            Container(
+              padding: const EdgeInsets.all(8),
+              color: const Color(0xFF161B22),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _msgController,
+                      style: const TextStyle(color: Colors.white),
+                      decoration: InputDecoration(
+                        hintText: 'Broadcast over offline mesh...',
+                        hintStyle: const TextStyle(color: Colors.white38),
+                        fillColor: const Color(0xFF0D1117),
+                        filled: true,
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(20), borderSide: BorderSide.none),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    icon: const Icon(Icons.send, color: Colors.greenAccent),
+                    onPressed: () {
+                      if (_msgController.text.trim().isNotEmpty) {
+                        _meshBloc.add(SendTextEvent(_username, _msgController.text.trim()));
+                        _msgController.clear();
+                      }
+                    },
+                  )
+                ],
               ),
             )
           ],
         ),
-      ),
-    );
-  }
-}
-
-// ---------------- 5. USER PROFILE & DETAILS SCREEN ----------------
-class UserProfileDetailsScreen extends StatefulWidget {
-  const UserProfileDetailsScreen({super.key});
-  @override
-  State<UserProfileDetailsScreen> createState() => _UserProfileDetailsScreenState();
-}
-
-class _UserProfileDetailsScreenState extends State<UserProfileDetailsScreen> {
-  String _name = "Loading...";
-  String _phone = "Loading...";
-  String _room = "None";
-
-  @override
-  void initState() {
-    super.initState();
-    _loadProfile();
-  }
-
-  void _loadProfile() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _name = prefs.getString('user_name') ?? 'Trekker';
-      _phone = prefs.getString('user_phone') ?? 'Not registered';
-      _room = prefs.getString('current_room_code') ?? 'None';
-    });
-  }
-
-  void _logout(BuildContext context) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.clear();
-    if (mounted) {
-      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginRegistrationScreen()));
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          children: [
-            const SizedBox(height: 10),
-            Center(
-              child: Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  border: Border.all(color: const Color(0xFF00E676), width: 2),
-                ),
-                child: const Icon(Icons.person, size: 70, color: Color(0xFF00E676)),
-              ),
-            ),
-            const SizedBox(height: 14),
-            Text(_name, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white)),
-            Text(_phone, style: const TextStyle(fontSize: 13, color: Color(0xFF4ADE80))),
-            const SizedBox(height: 24),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: const Color(0xFF10241A),
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: const Color(0xFF1F4330)),
-              ),
-              child: Column(
-                children: [
-                  _buildProfileRow("OPERATOR NAME", _name),
-                  const Divider(color: Color(0xFF1F4330)),
-                  _buildProfileRow("PRIMARY CONTACT", _phone),
-                  const Divider(color: Color(0xFF1F4330)),
-                  _buildProfileRow("ACTIVE ROOM CODE", _room),
-                  const Divider(color: Color(0xFF1F4330)),
-                  _buildProfileRow("MESH PROTOCOL", "GSM / SMS BROADCAST"),
-                  const Divider(color: Color(0xFF1F4330)),
-                  _buildProfileRow("SECURITY STATUS", "ENCRYPTED & AUTHENTICATED"),
-                ],
-              ),
-            ),
-            const Spacer(),
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: ElevatedButton.icon(
-                icon: const Icon(Icons.logout),
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFEF4444), foregroundColor: Colors.white),
-                onPressed: () => _logout(context),
-                label: const Text("DISCONNECT TERMINAL / LOGOUT", style: TextStyle(fontWeight: FontWeight.bold)),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildProfileRow(String title, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(title, style: const TextStyle(fontSize: 10, color: Color(0xFF4ADE80), fontWeight: FontWeight.bold)),
-          Text(value, style: const TextStyle(fontSize: 12, color: Colors.white)),
-        ],
       ),
     );
   }
